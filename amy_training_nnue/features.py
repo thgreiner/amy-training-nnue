@@ -2,12 +2,14 @@
 
 Amy (branch feature/neural-net-with-clamped-relu) uses king-relative
 features: for each side, one feature per (piece type, own king square,
-piece square).  There are 10 piece types (0..4 = own pawn..queen,
-5..9 = opponent pawn..queen; the kings are *not* input features),
-64 own king squares and 64 piece squares:
+piece square), plus one plane for the opponent king relative to own
+king.  There are 10 piece types (0..4 = own pawn..queen, 5..9 =
+opponent pawn..queen; the kings are *not* piece features), 64 own king
+squares, 64 piece squares, and plane 10 for the opponent king:
 
-    N_FEATURES = 10 * 64 * 64 = 40960
-    index = 4096 * piece_type + 64 * king_sq + piece_sq
+    N_FEATURES = 11 * 64 * 64 = 45056
+    plane 0..9: index = 4096 * piece_type + 64 * king_sq + piece_sq
+    plane 10:   index = 40960 + 64 * king_sq + opp_king_sq
 
 Squares are stored in the *own side's perspective*: for white that is
 the normal board, for black both the king square and the piece square
@@ -28,7 +30,8 @@ import numpy as np
 from .bpd import BLACK, WHITE
 
 N_PIECE_TYPES = 10
-N_FEATURES = 40960
+# 10 piece-type planes plus the opponent-king plane (plane 10).
+N_FEATURES = 11 * 64 * 64  # 45056
 ACCUMULATOR_SIZE = 128
 HIDDEN_SIZE_1 = 32
 HIDDEN_SIZE_2 = 32
@@ -43,9 +46,10 @@ def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return (white_accumulator_indices, black_accumulator_indices).
 
     ``board`` is a 64-element int8 array as in BpdRecord.board().
-    Each returned array holds the 40960-space index of every active
-    feature of that side's accumulator (typically 30 entries: 15 own
-    and 15 opponent pieces, kings excluded).
+    Each returned array holds the 45056-space index of every active
+    feature of that side's accumulator (typically 31 entries: 15 own
+    and 15 opponent pieces, kings excluded, plus the opponent-king
+    plane).
     """
     if (board == 6).sum() != 1 or (board == -6).sum() != 1:
         raise ValueError("board must contain exactly one king per side")
@@ -69,6 +73,9 @@ def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             if t < QUEEN:
                 black.append(4096 * t + 64 * black_king_persp + (sq ^ FLIP))
                 white.append(4096 * (t + 5) + 64 * white_king + sq)
+    # Plane 10: opponent king relative to own king (nn_build_accumulator).
+    white.append(4096 * 10 + 64 * white_king + black_king)
+    black.append(4096 * 10 + 64 * black_king_persp + (white_king ^ FLIP))
     return (np.asarray(white, dtype=np.int32), np.asarray(black, dtype=np.int32))
 
 

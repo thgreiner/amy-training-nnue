@@ -94,6 +94,7 @@ def cmd_train(args) -> int:
         val_fraction=args.val_fraction,
         seed=args.seed,
         target_scale=args.target_scale,
+        mirror_augment=args.mirror_augment,
         log_every=args.log_every,
         save_every=args.save_every,
         resume=args.resume,
@@ -190,6 +191,17 @@ def main(argv=None) -> int:
         help="save a checkpoint every N epochs (and at the end)",
     )
     p.add_argument("--resume", default=None, help="checkpoint dir to resume from")
+    p.add_argument(
+        "--mirror-augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "augment the dataset: add the horizontal mirror image of "
+            "positions without castling rights, and duplicate positions "
+            "with castling rights (on by default; --no-mirror-augment "
+            "disables it)"
+        ),
+    )
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("export", help="quantize a checkpoint to network.quant")

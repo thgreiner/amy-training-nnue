@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from amy_training_nnue.dataset import MAX_FEATURES
-from amy_training_nnue.features import feature_indices
+from amy_training_nnue.features import N_FEATURES, feature_indices
 from amy_training_nnue.quantize import (
     HEADER_SIZE,
     NETWORK_QUANT_SIZE,
@@ -28,25 +28,25 @@ def _feats(board):
 
 
 def test_network_size():
-    # 20-byte header + 40960*128*1 + 128*2 + 32*256*1 + 32*2 + 32*32*2
+    # 20-byte header + 45056*128*1 + 128*2 + 32*256*1 + 32*2 + 32*32*2
     # + 32*4 + 32*4 + 4
-    assert PAYLOAD_SIZE == 5_253_700
+    assert PAYLOAD_SIZE == 5_777_988
     assert HEADER_SIZE == 20
-    assert NETWORK_QUANT_SIZE == 5_253_720
+    assert NETWORK_QUANT_SIZE == 5_778_008
 
 
 def test_header_matches_c_struct():
     """The header must be byte-identical to C's WeightsHeader
-    (neural_net.c): magic, sizes 128/16/32, quant codes 1 2 1 2 2 3 3 3,
-    2 padding bytes."""
+    (neural_net.c): magic, sizes 128/45056/32/32, quant codes
+    1 2 1 2 2 3 3 3."""
     header = weights_header()
     assert len(header) == HEADER_SIZE == 20
-    assert header.hex() == "414d595780002000200001020102020303030000"
+    assert header.hex() == "414d5957800000b0200020000102010202030303"
 
 
 def _zero_net():
     q = {
-        "input_layer_weights_q": np.zeros((40960, 128), dtype=np.int8),
+        "input_layer_weights_q": np.zeros((N_FEATURES, 128), dtype=np.int8),
         "input_layer_bias_q": np.zeros(128, dtype=np.int16),
         "hidden_layer_1_weights_q": np.zeros((32, 256), dtype=np.int8),
         "hidden_layer_1_bias_q": np.zeros(32, dtype=np.int16),
@@ -126,7 +126,7 @@ def test_read_rejects_bad_header(tmp_path):
     for offset, (what, match) in {
         0: ("magic", "magic"),
         4: ("accumulator size", "sizes"),
-        10: ("quant codes", "quantization"),
+        12: ("quant codes", "quantization"),  # codes start after 4 x u16 sizes
     }.items():
         data = bytearray(path.read_bytes())
         data[offset] ^= 0xFF
@@ -143,7 +143,7 @@ def test_quantize_matches_int_arrays():
     """Quantizing float values v gives round(v * scale) ints."""
     rng = np.random.default_rng(0)
     float_params = {
-        "input_w": rng.normal(0, 0.02, (40960, 128)),
+        "input_w": rng.normal(0, 0.02, (N_FEATURES, 128)),
         "input_b": rng.normal(0, 0.02, 128),
         "h1_w": rng.normal(0, 0.06, (256, 32)),
         "h1_b": rng.normal(0, 0.1, 32),

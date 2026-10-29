@@ -118,13 +118,33 @@ class NnueNet(nn.Module):
         }
         (directory / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    @staticmethod
-    def load(directory: str | Path) -> "NnueNet":
+    # Expected shape per parameter name; used to reject checkpoints from
+    # an older architecture (e.g. 40960 input features) with a clear
+    # error instead of silently loading mismatched tensors.
+    EXPECTED_SHAPES = {
+        "input_w": (N_FEATURES, ACCUMULATOR_SIZE),
+        "input_b": (ACCUMULATOR_SIZE,),
+        "h1_w": (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1),
+        "h1_b": (HIDDEN_SIZE_1,),
+        "h2_w": (HIDDEN_SIZE_1, HIDDEN_SIZE_2),
+        "h2_b": (HIDDEN_SIZE_2,),
+        "out_w": (HIDDEN_SIZE_2,),
+        "out_b": (1,),
+    }
+
+    @classmethod
+    def load(cls, directory: str | Path) -> "NnueNet":
         import numpy as np
 
-        model = NnueNet.__new__(NnueNet)
+        model = cls.__new__(cls)
         nn.Module.__init__(model)
         weights = np.load(Path(directory) / "weights.npz", allow_pickle=False)
         for name, value in weights.items():
+            if name in cls.EXPECTED_SHAPES and value.shape != cls.EXPECTED_SHAPES[name]:
+                raise ValueError(
+                    f"{directory}: {name} has shape {value.shape}, expected "
+                    f"{cls.EXPECTED_SHAPES[name]} (stale checkpoint from an "
+                    "older architecture?)"
+                )
             setattr(model, name, mx.array(value))
         return model

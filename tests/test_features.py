@@ -3,7 +3,9 @@
 Index formula (amy neural_net.c):
     index = 4096 * piece_type + 64 * own_king_sq + own_perspective_sq
 with piece_type 0..4 = own pawn..queen, 5..9 = opponent pawn..queen,
-and black's perspective rank-flipped (sq ^ 0x38).
+plus plane 10: 40960 + 64 * own_king_sq + opp_king_sq (opponent king
+relative to own king), and black's perspective rank-flipped
+(sq ^ 0x38).
 """
 
 import numpy as np
@@ -49,7 +51,7 @@ def _board_from_epd(epd: str) -> np.ndarray:
 
 
 def test_n_features():
-    assert N_FEATURES == 10 * 64 * 64
+    assert N_FEATURES == 11 * 64 * 64
 
 
 def test_flip_is_rank_flip():
@@ -62,9 +64,10 @@ def test_flip_is_rank_flip():
 def test_initial_position_white_features():
     board = _board_from_epd(INIT)
     w, b = feature_indices(board)
-    # 15 own + 15 opponent non-king pieces per accumulator.
-    assert len(w) == 30
-    assert len(b) == 30
+    # 15 own + 15 opponent non-king pieces plus the opponent-king plane
+    # per accumulator.
+    assert len(w) == 31
+    assert len(b) == 31
     # All white pawns a2..h2: pt 0, king e1 (sq 4) -> 64*4 + 8..15
     assert set(range(64 * 4 + 8, 64 * 4 + 16)) <= set(w.tolist())
     # White rooks a1/h1: pt 3 -> 3*4096 + 64*4 + {0, 7}
@@ -76,7 +79,9 @@ def test_initial_position_white_features():
     # are opponents (pt 5):
     assert 5 * 4096 + 256 + 48 in w
     assert 5 * 4096 + 256 + 55 in w
-    assert 9 * 4096 + 256 + 60 not in w  # black king e8, opponent type 9
+    assert 9 * 4096 + 256 + 60 not in w  # black king e8 is no piece feature
+    # Plane 10: black king e8 (60) relative to white king e1 (4).
+    assert 4096 * 10 + 64 * 4 + 60 in w
     # Black rooks a8/h8 as opponents: pt 8
     assert 8 * 4096 + 256 + 56 in w
     assert 8 * 4096 + 256 + 63 in w
@@ -103,16 +108,21 @@ def test_initial_position_black_features():
     assert 5 * 4096 + 64 * 4 + 55 in b
     # White queen d1^0x38 = d8 (59) as opponent (pt 9)
     assert 9 * 4096 + 64 * 4 + 59 in b
+    # Plane 10: white king e1^0x38 = e8 (60) relative to black king
+    # e8^0x38 = e1 (4).
+    assert 4096 * 10 + 64 * 4 + 60 in b
 
 
-def test_no_king_features():
-    """Kings are not features; adding a second king must fail, and the
-    king's own square only shows up as other pieces' king offset."""
+def test_bare_kings_only_plane_10():
+    """With no pieces on the board, the only active feature is the
+    opponent-king plane; the kings themselves are not piece features."""
     board = _board_from_epd("4k3/8/8/8/8/8/8/4K3 w - -")
     w, b = feature_indices(board)
-    # no non-king pieces at all
-    assert len(w) == 0
-    assert len(b) == 0
+    # Kings: white e1 (sq 4), black e8 (sq 60).
+    assert w == [4096 * 10 + 64 * 4 + 60]
+    # In black's perspective (sq ^ 0x38): own king 60^0x38 = 4 (e1),
+    # opponent king 4^0x38 = 60 (e8).
+    assert b == [4096 * 10 + 64 * 4 + 60]
 
 
 def test_black_perspective_matches_flipped_white():

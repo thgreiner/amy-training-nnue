@@ -4,7 +4,7 @@ evaluate it with the exact integer arithmetic of neural_net.c.
 network.quant is a 20-byte little-endian header (the WeightsHeader
 struct of neural_net.c, see weights_header()) followed by, in order:
 
-    input_layer_weights_q  int8   [40960][ACCUMULATOR_SIZE]
+    input_layer_weights_q  int8   [45056][ACCUMULATOR_SIZE]
     input_layer_bias_q     int16  [ACCUMULATOR_SIZE]
     hidden_layer_1_weights_q int8 [HIDDEN_SIZE_1][512]
     hidden_layer_1_bias_q  int16  [HIDDEN_SIZE_1]
@@ -28,11 +28,12 @@ within [-1, 1] during training, so no clipping in practice); the int16
 hidden 1 bias at scale 4096 covers +-8.0.  Out-of-range values are
 clipped (with a warning) so the file stays loadable by amy.
 
-The header (little-endian, 20 bytes = 18 data bytes + 2 padding, must
-match neural_net.c's WeightsHeader byte-for-byte):
+The header (little-endian, 20 bytes, must match neural_net.c's
+WeightsHeader byte-for-byte):
 
-    u32 magic 0x5957414D (file bytes read as "AMYW")
-    u16 accumulator size, u16 hidden layer 1 size, u16 hidden layer 2 size
+    u32 magic 0x57594D41 (file bytes read as "AMYW")
+    u16 accumulator size, u16 number of input features (45056),
+    u16 hidden layer 1 size, u16 hidden layer 2 size
     8 x u8 quantization codes (1 = int8, 2 = int16, 3 = int32), one per
     field, in the same order as the fields above
 """
@@ -67,13 +68,14 @@ FIELD_ORDER = [
     ("output_layer_bias_q", np.int32, (1,)),
 ]
 
-# WeightsHeader of neural_net.c (little-endian, 20 bytes incl. padding).
+# WeightsHeader of neural_net.c (little-endian, 20 bytes, no padding).
 WEIGHTS_HEADER_MAGIC = 0x57594D41  # file bytes read as "AMYW"
 QUANT_INT8 = 1
 QUANT_INT16 = 2
 QUANT_INT32 = 3
-# u32 magic, 3 x u16 layer sizes, 8 x u8 quant codes, 2 padding bytes.
-HEADER_FORMAT = "<IHHH8B2x"
+# u32 magic, 4 x u16 sizes (accumulator, num features, h1, h2),
+# 8 x u8 quant codes.
+HEADER_FORMAT = "<IHHHH8B"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 _QUANT_CODES = {
@@ -94,6 +96,7 @@ def weights_header() -> bytes:
         HEADER_FORMAT,
         WEIGHTS_HEADER_MAGIC,
         ACCUMULATOR_SIZE,
+        N_FEATURES,
         HIDDEN_SIZE_1,
         HIDDEN_SIZE_2,
         *_header_quant_codes(),
@@ -172,19 +175,23 @@ def read_network_quant(path: str | Path) -> dict[str, np.ndarray]:
         raise ValueError(
             f"{path}: size {len(data)} != expected {NETWORK_QUANT_SIZE} bytes"
         )
-    magic, acc_size, h1_size, h2_size, *codes = struct.unpack_from(HEADER_FORMAT, data)
+    magic, acc_size, num_features, h1_size, h2_size, *codes = struct.unpack_from(
+        HEADER_FORMAT, data
+    )
     if magic != WEIGHTS_HEADER_MAGIC:
         raise ValueError(
             f"{path}: bad magic {magic:#010x}, expected {WEIGHTS_HEADER_MAGIC:#010x}"
         )
-    if (acc_size, h1_size, h2_size) != (
+    if (acc_size, num_features, h1_size, h2_size) != (
         ACCUMULATOR_SIZE,
+        N_FEATURES,
         HIDDEN_SIZE_1,
         HIDDEN_SIZE_2,
     ):
         raise ValueError(
-            f"{path}: header sizes {(acc_size, h1_size, h2_size)} != "
-            f"({ACCUMULATOR_SIZE}, {HIDDEN_SIZE_1}, {HIDDEN_SIZE_2})"
+            f"{path}: header sizes {(acc_size, num_features, h1_size, h2_size)} != "
+            f"({ACCUMULATOR_SIZE}, {N_FEATURES}, {HIDDEN_SIZE_1}, {HIDDEN_SIZE_2}) "
+            "(stale network.quant from an older architecture?)"
         )
     expected_codes = _header_quant_codes()
     if codes != expected_codes:

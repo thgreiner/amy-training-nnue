@@ -26,6 +26,24 @@ CASTLE_WK = 2
 CASTLE_BQ = 4
 CASTLE_BK = 8
 
+# Horizontal (file) flip: a1<->h1, a2<->h2, ...  Unlike FLIP (the black
+# perspective rank flip, 0x38) it keeps the rank and flips the file, so
+# the two masks commute.
+MIRROR_FLIP = 0x07
+
+
+def mirror_board(board: np.ndarray) -> np.ndarray:
+    """Mirror a 64-element board horizontally (flip files a<->h).
+
+    The piece on square ``sq`` of ``board`` ends up on square
+    ``sq ^ MIRROR_FLIP``.  Colors and piece types are preserved.  The
+    mirror of a position without castling rights is a valid chess
+    position with the same value (its game tree is isomorphic to the
+    original); the en passant square is not part of the board array
+    and is irrelevant for the network features.
+    """
+    return board[np.arange(64) ^ MIRROR_FLIP]
+
 
 class Position:
     """A chess position decoded from a BPD record."""

@@ -19,6 +19,12 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from amy_training_nnue.features import (  # noqa: E402
+    ACCUMULATOR_SIZE,
+    HIDDEN_SIZE_1,
+    HIDDEN_SIZE_2,
+    N_FEATURES,
+)
 from amy_training_nnue.quantize import quantize_parameters, write_network_quant  # noqa: E402
 
 AMY = (
@@ -43,13 +49,13 @@ SEED = 1234
 # scale 64 (and the range trained weights are kept in).
 rng = np.random.default_rng(SEED)
 params = {
-    "input_w": rng.uniform(-1, 1, (40960, 256)),
-    "input_b": rng.uniform(-1, 1, (256,)),
-    "h1_w": rng.uniform(-2, 2, (512, 32)),
-    "h1_b": rng.uniform(-2, 2, (32,)),
-    "h2_w": rng.uniform(-2, 2, (32, 32)),
-    "h2_b": rng.uniform(-2, 2, (32,)),
-    "out_w": rng.uniform(-1, 1, (32,)),
+    "input_w": rng.uniform(-1, 1, (N_FEATURES, ACCUMULATOR_SIZE)),
+    "input_b": rng.uniform(-1, 1, (ACCUMULATOR_SIZE,)),
+    "h1_w": rng.uniform(-2, 2, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
+    "h1_b": rng.uniform(-2, 2, (HIDDEN_SIZE_1,)),
+    "h2_w": rng.uniform(-2, 2, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
+    "h2_b": rng.uniform(-2, 2, (HIDDEN_SIZE_2,)),
+    "out_w": rng.uniform(-1, 1, (HIDDEN_SIZE_2,)),
     "out_b": rng.uniform(-1, 1, (1,)),
 }
 quantized = quantize_parameters(params)

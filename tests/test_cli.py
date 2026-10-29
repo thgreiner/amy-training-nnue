@@ -51,7 +51,7 @@ def test_train_and_export_and_evaluate(tmp_path):
         "--seed",
         "0",
     )
-    assert "loaded 5 positions" in result.stdout
+    assert "loaded 10 positions (2 mirrored, 3 duplicated)" in result.stdout
     final = out / "final"
     assert (final / "weights.npz").exists()
     assert (final / "meta.json").exists()

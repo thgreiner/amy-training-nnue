@@ -37,6 +37,8 @@ class TrainConfig:
     val_fraction: float = 0.1
     seed: int = 0
     target_scale: float = DEFAULT_TARGET_SCALE
+    # Mirror dataset augmentation (see BpdDataset): on by default.
+    mirror_augment: bool = True
     log_every: int = 20
     save_every: int = 10
     resume: str | None = None
@@ -145,11 +147,18 @@ def train(config: TrainConfig) -> Path:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ds = BpdDataset(config.paths, target_scale=config.target_scale)
+    ds = BpdDataset(
+        config.paths,
+        target_scale=config.target_scale,
+        mirror_augment=config.mirror_augment,
+    )
     if ds.n_invalid:
         print(f"skipped {ds.n_invalid} invalid records")
+    augment_info = ""
+    if config.mirror_augment:
+        augment_info = f" ({ds.n_mirrored} mirrored, {ds.n_duplicated} duplicated)"
     print(
-        f"loaded {ds.n} positions: "
+        f"loaded {ds.n} positions{augment_info}: "
         f"score {ds.score.min()}..{ds.score.max()} mp, "
         f"mean {ds.score.mean():.0f} mp"
     )
@@ -231,6 +240,9 @@ def train(config: TrainConfig) -> Path:
     val = _float_metrics(model, ds, val_idx)
     meta = {
         "n_positions": ds.n,
+        "mirror_augment": config.mirror_augment,
+        "n_mirrored": ds.n_mirrored,
+        "n_duplicated": ds.n_duplicated,
         "target_scale": config.target_scale,
         "epochs": config.epochs,
         "lr": config.lr,

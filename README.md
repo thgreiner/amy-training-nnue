@@ -3,7 +3,7 @@
 Training application for amy's NNUE evaluation function.
 
 Trains the weights of the neural network used by amy's
-`feature/neural-net-with-clamped-relu` branch from amy selfplay data in
+`feature/relative-king-positions` branch from amy selfplay data in
 [BPD format](https://github.com/thgreiner/amy), and exports the raw
 `network.quant` weight file that amy loads at startup.
 
@@ -13,9 +13,9 @@ The network mirrors amy's C implementation (`src/neural_net.c`) exactly:
 
 | Stage | amy C | Python |
 |---|---|---|
-| Features | 40960 king-relative bit-planes (6 piece types x own/opponent x 64 king squares x ... ), index `4096*tp + 64*king_sq + sq`, black side rank-flipped with `sq ^ 0x38` | `amy_training_nnue/features.py` |
-| Accumulator | per-side int16 vector of 256 (units of 1/64), clamped to `[0, 64]` at evaluation | `model.py` (float), `quantize.py` (int16) |
-| Network | 2x256 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 31) / 64` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
+| Features | 45056 king-relative bit-planes: 10 piece types (5 own + 5 opponent) x 64 king squares x 64 squares, plus plane 10 (opponent king relative to own king), index `4096*tp + 64*king_sq + sq` / `40960 + 64*king_sq + opp_king_sq`, black side rank-flipped with `sq ^ 0x38` | `amy_training_nnue/features.py` |
+| Accumulator | per-side int16 vector of 128 (units of 1/64), clamped to `[0, 64]` at evaluation | `model.py` (float), `quantize.py` (int16) |
+| Network | 2x128 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 31) / 64` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
 | Output | `((out + 4095) / 8192) * 10000` then `(r + 4095) / 8192` -> millipawns, C truncating division | same, `quantize.py` |
 | Constants | `SCALE = 8192`, `SCALE_INPUT = 64`, `SCALE_INPUT_HALF = 31`, `SCALE_HALF = 4095`, `SCALE_OUTPUT = 10000` | identical |
 
@@ -27,7 +27,7 @@ uses `int8` x 64 weights with an `int16` x 64 x 64 bias (activations in
 bias (activations in [0, 8192]), and the output layer `int32` x 8192 /
 `int32` x 8192^2. `QuantizedNet` in `quantize.py` simulates that integer
 pipeline bit-exactly and is used to report quantized metrics. The file is
-10,505,028 bytes.
+5,778,008 bytes (20-byte header + fields).
 
 ## Setup
 
@@ -63,7 +63,13 @@ Copy the produced `network.quant` into amy's working directory (next to the
 
 Training options of note: `--lr`, `--weight-decay`, `--val-fraction`,
 `--save-every N` (checkpoint cadence; every checkpoint is ~42 MB),
-`--resume <dir>` (continue from a float checkpoint).
+`--resume <dir>` (continue from a float checkpoint),
+`--no-mirror-augment` (disable the dataset mirror augmentation that is
+on by default: positions where neither side has castling rights are
+trained on their horizontal mirror image as well, and positions with
+castling rights are duplicated, so the dataset doubles in size; a 10
+epochs / batch 2048 A/B on the full log cut quantized val rmse from
+375 to 265 mp).
 
 ## Data
 
@@ -87,9 +93,8 @@ The Python pipeline is verified **bit-exact** against amy's C code:
 Regenerate the cross-check reference (needs the amy NNUE checkout):
 
 ```bash
-# in the amy checkout (feature/neural-net-with-clamped-relu):
-cd src && gcc -std=gnu23 -g -O3 -mcpu=apple-m1 -I../include -I.. \
-    nn_crosscheck.c $(ls *.o | grep -v '^main.o$') -o nn_crosscheck
+# in the amy checkout (feature/relative-king-positions):
+make            # builds src/Amy and src/nn_crosscheck
 # then:
 python tools/make_crosscheck_reference.py [AMY_DIR]
 ```
@@ -97,17 +102,19 @@ python tools/make_crosscheck_reference.py [AMY_DIR]
 Run the full suite:
 
 ```bash
-python -m pytest tests/ -q   # 40 tests
+python -m pytest tests/ -q   # 52 tests
 ```
 
 ## Current results
 
-On the ~1M-record selfplay log (`../amy/evaluation_log.bin`), 30 epochs,
-AdamW lr=1e-3, batch 256, seed 0, on an M1 Pro (about 40 min):
+On the 3.28M-record selfplay log (`../amy/evaluation_log.bin`), 30 epochs,
+AdamW lr=1e-3, batch 2048, seed 0, on an M1 Pro. Metrics on the full log
+(`python -m amy_training_nnue evaluate`, 11-plane net with opponent-king
+plane 10):
 
 ```
-val: rmse 485 mp, mae 176 mp, corr 0.9869, r2 0.9735, within 25cp 0.995
-float and quantized metrics agree (rmse 485 vs 490 mp)
+quantized: rmse 213 mp, mae 152 mp, corr 0.9911, r2 0.9823, within 25cp 1.000
+float    : rmse 204 mp, mae 144 mp, corr 0.9919, r2 0.9838, within 25cp 1.000
 ```
 
 `tests/data/selfplay_sample.bin` is a frozen 5% snapshot of the selfplay
