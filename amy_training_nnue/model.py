@@ -119,8 +119,8 @@ class NnueNet(nn.Module):
         (directory / "meta.json").write_text(json.dumps(meta, indent=2))
 
     # Expected shape per parameter name; used to reject checkpoints from
-    # an older architecture (e.g. 40960 input features) with a clear
-    # error instead of silently loading mismatched tensors.
+    # an older architecture (e.g. the 45056-feature king-square layout)
+    # with a clear error instead of silently loading mismatched tensors.
     EXPECTED_SHAPES = {
         "input_w": (N_FEATURES, ACCUMULATOR_SIZE),
         "input_b": (ACCUMULATOR_SIZE,),

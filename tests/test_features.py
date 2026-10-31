@@ -1,26 +1,33 @@
 """Tests for the NNUE feature mapping against hand-computed indices.
 
-Index formula (amy neural_net.c):
-    index = 4096 * piece_type + 64 * own_king_sq + own_perspective_sq
-with piece_type 0..4 = own pawn..queen, 5..9 = opponent pawn..queen,
-plus plane 10: 40960 + 64 * own_king_sq + opp_king_sq (opponent king
-relative to own king), and black's perspective rank-flipped
-(sq ^ 0x38).
+Index formula (amy neural_net.c, king-half canonical frame):
+    index = 2048 * plane + 64 * king_index + sq'
+with plane 0..9 = own pawn..queen / opponent pawn..queen and plane 10 =
+opponent king relative to own king; ``king_index`` is the side's king in
+the canonical (left-half) frame, a1 = 0 ... d1 = 3, ..., a8 = 28 ...
+d8 = 31, and ``sq'`` is the piece square in that frame: black's squares
+are rank-flipped (``sq ^ 0x38``) and, whenever the own king stands on
+files e..h, the whole frame is mirrored horizontally (``sq ^ 0x07``).
 """
 
 import numpy as np
 import pytest
 
-from amy_training_nnue.bpd import BLACK, WHITE, read_records
-from amy_training_nnue.features import FLIP, N_FEATURES, feature_indices
-from amy_training_nnue.position import position_from_record
+from amy_training_nnue.bpd import BLACK, WHITE
+from amy_training_nnue.features import (
+    FLIP,
+    MIRROR,
+    N_FEATURES,
+    PLANE_SIZE,
+    canonical_frame,
+    feature_indices,
+)
+from amy_training_nnue.position import mirror_board
 
 INIT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"
 
 
 def _board_from_epd(epd: str) -> np.ndarray:
-    import string
-
     pieces = {
         "P": (1, 1),
         "N": (1, 2),
@@ -51,14 +58,52 @@ def _board_from_epd(epd: str) -> np.ndarray:
 
 
 def test_n_features():
-    assert N_FEATURES == 11 * 64 * 64
+    assert N_FEATURES == 11 * 32 * 64 == 22528
+    # Max index: plane 10, king_index 31 (d8), square 63.
+    assert PLANE_SIZE * 10 + 64 * 31 + 63 == N_FEATURES - 1
 
 
-def test_flip_is_rank_flip():
+def test_flip_masks_commute():
     assert FLIP == 0x38
+    assert MIRROR == 0x07
     assert (0 ^ FLIP) == 56  # a1 <-> a8
     assert (63 ^ FLIP) == 7  # h8 <-> h1
-    assert (8 ^ FLIP) == 48  # a2 <-> a6
+    assert (0 ^ MIRROR) == 7  # a1 <-> h1
+    for sq in range(64):
+        assert (sq ^ FLIP ^ MIRROR) == (sq ^ MIRROR ^ FLIP)
+
+
+def test_canonical_frame_left_half_unchanged():
+    # White king on files a..d: no mirror, king_index = file + 4 * rank.
+    assert canonical_frame(WHITE, 0) == (0, 0)  # a1
+    assert canonical_frame(WHITE, 3) == (0, 3)  # d1
+    assert canonical_frame(WHITE, 59) == (0, 31)  # d8
+    # Black king a8 (56): own perspective a1 (0), no mirror.
+    assert canonical_frame(BLACK, 56) == (FLIP, 0)
+    # Black king d8 (59): own perspective d1 (3), no mirror.
+    assert canonical_frame(BLACK, 59) == (FLIP, 3)
+
+
+def test_canonical_frame_right_half_mirrored():
+    # White king e1 (4): mirrored to d1 (3); every square file-flipped.
+    assert canonical_frame(WHITE, 4) == (MIRROR, 3)
+    assert canonical_frame(WHITE, 7) == (MIRROR, 0)  # h1 -> a1
+    assert canonical_frame(WHITE, 63) == (MIRROR, 28)  # h8 -> a8
+    # Black king e8 (60): own perspective e1 (4) -> mirrored to d1 (3).
+    assert canonical_frame(BLACK, 60) == (FLIP | MIRROR, 3)
+    # Black king h8 (63): own perspective h1 (7) -> mirrored to a1 (0).
+    assert canonical_frame(BLACK, 63) == (FLIP | MIRROR, 0)
+
+
+def test_king_index_collapses_mirror_pairs():
+    # Every one of the 64 king squares maps into 0..31, and a square and
+    # its horizontal mirror always share a king_index (the folding that
+    # makes N_FEATURES 32-per-plane instead of 64).
+    for side in (WHITE, BLACK):
+        for sq in range(64):
+            _, k = canonical_frame(side, sq)
+            assert 0 <= k <= 31
+            assert k == canonical_frame(side, sq ^ MIRROR)[1]
 
 
 def test_initial_position_white_features():
@@ -68,23 +113,25 @@ def test_initial_position_white_features():
     # per accumulator.
     assert len(w) == 31
     assert len(b) == 31
-    # All white pawns a2..h2: pt 0, king e1 (sq 4) -> 64*4 + 8..15
-    assert set(range(64 * 4 + 8, 64 * 4 + 16)) <= set(w.tolist())
-    # White rooks a1/h1: pt 3 -> 3*4096 + 64*4 + {0, 7}
-    assert 3 * 4096 + 256 + 0 in w
-    assert 3 * 4096 + 256 + 7 in w
-    # White queen d1: pt 4
-    assert 4 * 4096 + 256 + 3 in w
-    # Black king e8 is *not* a feature; black pawns a7..h7 (sq 48..55)
-    # are opponents (pt 5):
-    assert 5 * 4096 + 256 + 48 in w
-    assert 5 * 4096 + 256 + 55 in w
-    assert 9 * 4096 + 256 + 60 not in w  # black king e8 is no piece feature
-    # Plane 10: black king e8 (60) relative to white king e1 (4).
-    assert 4096 * 10 + 64 * 4 + 60 in w
-    # Black rooks a8/h8 as opponents: pt 8
-    assert 8 * 4096 + 256 + 56 in w
-    assert 8 * 4096 + 256 + 63 in w
+    # White frame: king e1 (sq 4) -> mirrored to d1 -> king_index 3,
+    # every square file-flipped (sq ^ 0x07).
+    # White pawns a2..h2 (sq 8..15 -> 15..8): plane 0 -> 64*3 + 8..15.
+    assert set(range(64 * 3 + 8, 64 * 3 + 16)) <= set(w.tolist())
+    # White rooks a1/h1 (0->7, 7->0): plane 3 -> 3*2048 + 192 + {0, 7}.
+    assert 3 * PLANE_SIZE + 192 + 0 in w
+    assert 3 * PLANE_SIZE + 192 + 7 in w
+    # White queen d1 (3->4): plane 4.
+    assert 4 * PLANE_SIZE + 192 + 4 in w
+    # Black pawns a7..h7 (sq 48..55 -> 55..48) are opponents (plane 5):
+    assert 5 * PLANE_SIZE + 192 + 48 in w
+    assert 5 * PLANE_SIZE + 192 + 55 in w
+    # Black king e8 is *not* a feature (the plane-10 index covers it).
+    assert 9 * PLANE_SIZE + 192 + (60 ^ MIRROR) not in w
+    # Plane 10: black king e8 (60 -> 59) relative to white king d1 (3).
+    assert PLANE_SIZE * 10 + 64 * 3 + 59 in w
+    # Black rooks a8/h8 (56->63, 63->56) as opponents: plane 8.
+    assert 8 * PLANE_SIZE + 192 + 56 in w
+    assert 8 * PLANE_SIZE + 192 + 63 in w
     # Every index in range.
     assert min(w) >= 0 and max(w) < N_FEATURES
     assert min(b) >= 0 and max(b) < N_FEATURES
@@ -93,36 +140,74 @@ def test_initial_position_white_features():
 def test_initial_position_black_features():
     board = _board_from_epd(INIT)
     w, b = feature_indices(board)
-    # Black's own pawns a7..h7 (sq 48..55), king e8 (60) -> in black's
-    # perspective (sq ^ 0x38): pawns 48^0x38..55^0x38 = 8..15, king
-    # 60^0x38 = 4 (e1).
-    assert set(range(64 * 4 + 8, 64 * 4 + 16)) <= set(b.tolist())
-    # Black's own queen d8: d8^0x38 = d1 (3) -> pt 4
-    assert 4 * 4096 + 64 * 4 + 3 in b
-    # Black's own rooks a8/h8: a8^0x38 = a1 (0), h8^0x38 = h1 (7), pt 3
-    assert 3 * 4096 + 64 * 4 + 0 in b
-    assert 3 * 4096 + 64 * 4 + 7 in b
-    # White pawns a2..h2 as opponent (pt 5) in black's perspective:
-    # a2^0x38 = a6 (48) .. h2^0x38 = h6 (55).
-    assert 5 * 4096 + 64 * 4 + 48 in b
-    assert 5 * 4096 + 64 * 4 + 55 in b
-    # White queen d1^0x38 = d8 (59) as opponent (pt 9)
-    assert 9 * 4096 + 64 * 4 + 59 in b
-    # Plane 10: white king e1^0x38 = e8 (60) relative to black king
-    # e8^0x38 = e1 (4).
-    assert 4096 * 10 + 64 * 4 + 60 in b
+    # Black frame: own king e8 (60) -> own perspective e1 (4) ->
+    # mirrored to d1 (3), so flip = 0x38 | 0x07, king_index 3.
+    # Black's own pawns a7..h7 (48..55 -> 15..8): plane 0.
+    assert set(range(64 * 3 + 8, 64 * 3 + 16)) <= set(b.tolist())
+    # Black's own queen d8 (59 -> 4): plane 4.
+    assert 4 * PLANE_SIZE + 64 * 3 + 4 in b
+    # Black's own rooks a8/h8 (56->7, 63->0): plane 3.
+    assert 3 * PLANE_SIZE + 64 * 3 + 0 in b
+    assert 3 * PLANE_SIZE + 64 * 3 + 7 in b
+    # White pawns a2..h2 (8..15 -> 55..48) as opponents (plane 5):
+    assert 5 * PLANE_SIZE + 64 * 3 + 48 in b
+    assert 5 * PLANE_SIZE + 64 * 3 + 55 in b
+    # White queen d1 (3 -> 60) as opponent (plane 9):
+    assert 9 * PLANE_SIZE + 64 * 3 + 60 in b
+    # Plane 10: white king 4 -> 59 relative to black king (canonical 3).
+    assert PLANE_SIZE * 10 + 64 * 3 + 59 in b
 
 
 def test_bare_kings_only_plane_10():
     """With no pieces on the board, the only active feature is the
-    opponent-king plane; the kings themselves are not piece features."""
+    opponent-king plane; the kings themselves are not piece features.
+
+    Kings e1/e8 (both on file e -> both frames mirrored): plane 10 =
+    2048*10 + 64*3 + 59 = 20731 for both sides (CHANGES worked example
+    1)."""
     board = _board_from_epd("4k3/8/8/8/8/8/8/4K3 w - -")
     w, b = feature_indices(board)
-    # Kings: white e1 (sq 4), black e8 (sq 60).
-    assert w == [4096 * 10 + 64 * 4 + 60]
-    # In black's perspective (sq ^ 0x38): own king 60^0x38 = 4 (e1),
-    # opponent king 4^0x38 = 60 (e8).
-    assert b == [4096 * 10 + 64 * 4 + 60]
+    assert w == [PLANE_SIZE * 10 + 64 * 3 + 59]
+    assert b == [PLANE_SIZE * 10 + 64 * 3 + 59]
+
+
+def test_left_and_right_half_kings_share_features():
+    """Kings e1/e8 and kings d1/d8 are horizontal mirrors of each
+    other; with the canonical frame they must map to the *same*
+    feature vector (CHANGES worked example 2, the data folding that
+    replaces mirror augmentation)."""
+    e1_e8 = _board_from_epd("4k3/8/8/8/8/8/8/4K3 w - -")
+    d1_d8 = _board_from_epd("3k4/8/8/8/8/8/8/3K4 w - -")
+    w1, b1 = feature_indices(e1_e8)
+    w2, b2 = feature_indices(d1_d8)
+    np.testing.assert_array_equal(w1, w2)
+    np.testing.assert_array_equal(b1, b2)
+
+
+def test_mirrored_board_has_identical_features():
+    """For any position, the horizontal mirror image produces identical
+    feature vectors for both sides."""
+    for epd in (
+        INIT,
+        "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq -",
+        "3r1k2/p3qppp/8/3p4/3r4/5QP1/P4PB1/4R1K1 w - -",
+    ):
+        board = _board_from_epd(epd)
+        w1, b1 = feature_indices(board)
+        w2, b2 = feature_indices(mirror_board(board))
+        assert sorted(w1.tolist()) == sorted(w2.tolist()), epd
+        assert sorted(b1.tolist()) == sorted(b2.tolist()), epd
+
+
+def test_max_index_at_corner():
+    # White king d8 (canonical, no mirror), black king h8: plane 10,
+    # king_index 31, square 63 -> the last feature index.
+    board = _board_from_epd("3K3k/8/8/8/8/8/8/8 w - -")
+    w, b = feature_indices(board)
+    assert w == [PLANE_SIZE * 10 + 64 * 31 + 63] == [N_FEATURES - 1]
+    # Black frame: king h8 (63) -> perspective h1 (7) -> mirrored to a1
+    # (king_index 0); white king d8 (59) -> 59 ^ (0x38|0x07) = 4.
+    assert b == [PLANE_SIZE * 10 + 64 * 0 + 4]
 
 
 def test_black_perspective_matches_flipped_white():
@@ -158,7 +243,9 @@ def test_en_passant_square_is_empty_for_features():
     board = _board_from_epd("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6")
     w, b = feature_indices(board)
     ep = 43  # d6
-    assert 4096 * 0 + 64 * 4 + ep not in w  # own pawn (white view)
-    assert 4096 * 5 + 64 * 4 + ep not in w  # opponent pawn (white view)
-    assert 4096 * 0 + 64 * 4 + (ep ^ FLIP) not in b
-    assert 4096 * 5 + 64 * 4 + (ep ^ FLIP) not in b
+    w_flip, w_king = canonical_frame(WHITE, 4)  # e1
+    b_flip, b_king = canonical_frame(BLACK, 60)  # e8
+    assert PLANE_SIZE * 0 + 64 * w_king + (ep ^ w_flip) not in w  # own pawn
+    assert PLANE_SIZE * 5 + 64 * w_king + (ep ^ w_flip) not in w  # opponent pawn
+    assert PLANE_SIZE * 0 + 64 * b_king + (ep ^ b_flip) not in b
+    assert PLANE_SIZE * 5 + 64 * b_king + (ep ^ b_flip) not in b

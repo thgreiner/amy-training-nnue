@@ -11,7 +11,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as mxopt
 import numpy as np
-from mlx.nn.losses import huber_loss
 
 from .dataset import BpdDataset
 from .model import DEFAULT_TARGET_SCALE, WEIGHT_NAMES, NnueNet
@@ -37,8 +36,6 @@ class TrainConfig:
     val_fraction: float = 0.1
     seed: int = 0
     target_scale: float = DEFAULT_TARGET_SCALE
-    # Mirror dataset augmentation (see BpdDataset): on by default.
-    mirror_augment: bool = True
     log_every: int = 20
     save_every: int = 10
     resume: str | None = None
@@ -46,7 +43,8 @@ class TrainConfig:
 
 
 def _metrics(pred: np.ndarray, target: np.ndarray) -> dict:
-    """Metrics in millipawns; pred/target in the model's output units."""
+    """Metrics in millipawns (model units x 10000) from pred/target in the
+    model's output units (tanh-squeezed, see _loss and _float_metrics)."""
     if len(pred) == 0:
         return {
             "rmse_mp": float("nan"),
@@ -98,8 +96,12 @@ def model_predictions(
 
 def _float_metrics(model: NnueNet, ds: BpdDataset, idx: np.ndarray) -> dict:
     pred = model_predictions(model, ds, idx)
-    m = _metrics(pred, ds.target[idx])
-    m["loss"] = float(np.mean((pred - ds.target[idx]) ** 2))
+    # The loss trains in tanh-squeezed space, so measure there as well:
+    # the raw output is not in 1/10000 pawn units anymore.
+    pred = np.tanh(pred)
+    target = np.tanh(ds.target[idx])
+    m = _metrics(pred, target)
+    m["loss"] = float(np.mean((pred - target) ** 2))
     return m
 
 
@@ -138,27 +140,26 @@ def weight_max_abs(model: NnueNet) -> dict:
 
 
 def _loss(model, fw, fb, turn, target):
-    out = model(fw, fb, turn)
-    # return mx.mean((out - target) ** 2)
-    return mx.mean(huber_loss(out, target, 1.5))
+    """MSE in tanh-squeezed space: targets are score/10000, but the loss
+    trains tanh(out) against tanh(target), squeezing large score swings
+    into (-1, 1).  For playing strength, capturing about-even positions
+    (eval near 0) accurately matters more than predicting large
+    positive/negative scores exactly (literature confirms), and tanh
+    biases the network toward that regime."""
+    out = mx.tanh(model(fw, fb, turn))
+    target = mx.tanh(target)
+    return mx.mean((out - target) ** 2)
 
 
 def train(config: TrainConfig) -> Path:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ds = BpdDataset(
-        config.paths,
-        target_scale=config.target_scale,
-        mirror_augment=config.mirror_augment,
-    )
+    ds = BpdDataset(config.paths, target_scale=config.target_scale)
     if ds.n_invalid:
         print(f"skipped {ds.n_invalid} invalid records")
-    augment_info = ""
-    if config.mirror_augment:
-        augment_info = f" ({ds.n_mirrored} mirrored, {ds.n_duplicated} duplicated)"
     print(
-        f"loaded {ds.n} positions{augment_info}: "
+        f"loaded {ds.n} positions: "
         f"score {ds.score.min()}..{ds.score.max()} mp, "
         f"mean {ds.score.mean():.0f} mp"
     )
@@ -182,8 +183,10 @@ def train(config: TrainConfig) -> Path:
     def step(fw, fb, turn, target):
         loss, grads = loss_and_grad_fn(model, fw, fb, turn, target)
         opt.update(model, grads)
+
         if bound is not None:
             model.clip_weights(bound)
+
         return loss
 
     losses = config.history
@@ -221,7 +224,7 @@ def train(config: TrainConfig) -> Path:
         losses.append({"epoch": epoch + 1, "loss": avg, "seconds": dt})
         print(
             f"epoch {epoch + 1}/{config.epochs} done in {dt:.1f}s, "
-            f"avg loss {avg:.6f}",
+            f"avg loss {avg:.6g}",
             flush=True,
         )
 
@@ -240,9 +243,6 @@ def train(config: TrainConfig) -> Path:
     val = _float_metrics(model, ds, val_idx)
     meta = {
         "n_positions": ds.n,
-        "mirror_augment": config.mirror_augment,
-        "n_mirrored": ds.n_mirrored,
-        "n_duplicated": ds.n_duplicated,
         "target_scale": config.target_scale,
         "epochs": config.epochs,
         "lr": config.lr,

@@ -27,7 +27,6 @@ def test_train_keeps_weights_in_bounds(tmp_path):
         lr=1.0,
         weight_decay=0.0,
         seed=0,
-        mirror_augment=False,
         log_every=1,
         save_every=10,
     )
@@ -40,39 +39,11 @@ def test_train_keeps_weights_in_bounds(tmp_path):
     assert quant.stat().st_size == NETWORK_QUANT_SIZE
 
 
-def test_mirror_augment_on_by_default():
-    """Mirror augmentation is part of the standard training pipeline."""
-    config = TrainConfig(paths=[str(DATA)])
-    assert config.mirror_augment is True
-
-
-def test_train_with_mirror_augment(tmp_path):
-    """The mirror augmentation path runs end-to-end and is recorded in
-    the final meta.json."""
-    config = TrainConfig(
-        paths=[str(DATA)],
-        output_dir=str(tmp_path / "ckpts"),
-        epochs=2,
-        batch_size=4,
-        lr=1e-3,
-        weight_decay=0.0,
-        seed=0,
-        mirror_augment=True,
-    )
-    final = train(config)
-    meta = json.loads((final / "meta.json").read_text())
-    assert meta["mirror_augment"] is True
-    # bpd_test.bin: 3 records with castling rights (duplicated) + 2
-    # without (mirrored) -> 10 rows.
-    assert meta["n_positions"] == 10
-    assert meta["n_mirrored"] == 2
-    assert meta["n_duplicated"] == 3
-
-
 def test_train_smoke_on_sample(tmp_path):
     """One epoch on the frozen 5% selfplay sample: the pipeline must
-    actually learn (beat the ~2900 mp zero-prediction baseline) and
-    export a valid network."""
+    actually learn (beat the zero-prediction baseline — rmse of the
+    tanh-squeezed targets, about 0.23 = 2300 mp on this sample — and
+    correlate with them) and export a valid network."""
     config = TrainConfig(
         paths=[str(SAMPLE)],
         output_dir=str(tmp_path / "ckpts"),
@@ -85,7 +56,8 @@ def test_train_smoke_on_sample(tmp_path):
     final = train(config)
     meta = json.loads((final / "meta.json").read_text())
     val = meta["val"]
-    assert val["rmse_mp"] < 2500, val
+    # Zero-prediction baseline in tanh space is about 0.23 (2300 mp).
+    assert val["rmse_mp"] < 2300, val
     assert val["corr"] > 0.5, val
     assert (final / "weights.npz").exists()
     quant = Path(config.output_dir) / "network.quant"

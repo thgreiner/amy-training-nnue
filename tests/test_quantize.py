@@ -1,14 +1,31 @@
-"""Tests for quantization to amy's network.quant format."""
+"""Tests for quantization to amy's network.quant format.
+
+Shapes and scales come from the architecture constants (features.py,
+quantize.py), not from hardcoded numbers, so the tests keep working
+when the network structure changes for experiments.
+"""
+
+import struct
 
 import numpy as np
 import pytest
 
 from amy_training_nnue.dataset import MAX_FEATURES
-from amy_training_nnue.features import N_FEATURES, feature_indices
+from amy_training_nnue.features import (
+    ACCUMULATOR_SIZE,
+    HIDDEN_SIZE_1,
+    HIDDEN_SIZE_2,
+    N_FEATURES,
+    feature_indices,
+)
 from amy_training_nnue.quantize import (
+    FIELD_ORDER,
     HEADER_SIZE,
     NETWORK_QUANT_SIZE,
-    PAYLOAD_SIZE,
+    SCALE,
+    SCALE_INPUT,
+    SCALE_OUTPUT,
+    WEIGHTS_HEADER_MAGIC,
     QuantizedNet,
     quantize_parameters,
     read_network_quant,
@@ -27,59 +44,59 @@ def _feats(board):
     return fw, fb
 
 
-def test_network_size():
-    # 20-byte header + 45056*128*1 + 128*2 + 32*256*1 + 32*2 + 32*32*2
-    # + 32*4 + 32*4 + 4
-    assert PAYLOAD_SIZE == 5_777_988
-    assert HEADER_SIZE == 20
-    assert NETWORK_QUANT_SIZE == 5_778_008
-
-
 def test_header_matches_c_struct():
     """The header must be byte-identical to C's WeightsHeader
-    (neural_net.c): magic, sizes 128/45056/32/32, quant codes
-    1 2 1 2 2 3 3 3."""
+    (neural_net.c): u32 magic, 4 x u16 architecture sizes, then one
+    u8 quantization code per field (1 = int8, 2 = int16, 3 = int32)
+    in FIELD_ORDER order: 1 2 1 2 2 3 3 3."""
     header = weights_header()
     assert len(header) == HEADER_SIZE == 20
-    assert header.hex() == "414d5957800000b0200020000102010202030303"
+    assert header == struct.pack(
+        "<IHHHH8B",
+        WEIGHTS_HEADER_MAGIC,
+        ACCUMULATOR_SIZE,
+        N_FEATURES,
+        HIDDEN_SIZE_1,
+        HIDDEN_SIZE_2,
+        1,
+        2,
+        1,
+        2,
+        2,
+        3,
+        3,
+        3,
+    )
 
 
 def _zero_net():
-    q = {
-        "input_layer_weights_q": np.zeros((N_FEATURES, 128), dtype=np.int8),
-        "input_layer_bias_q": np.zeros(128, dtype=np.int16),
-        "hidden_layer_1_weights_q": np.zeros((32, 256), dtype=np.int8),
-        "hidden_layer_1_bias_q": np.zeros(32, dtype=np.int16),
-        "hidden_layer_2_weights_q": np.zeros((32, 32), dtype=np.int16),
-        "hidden_layer_2_bias_q": np.zeros(32, dtype=np.int32),
-        "output_layer_weights_q": np.zeros(32, dtype=np.int32),
-        "output_layer_bias_q": np.zeros(1, dtype=np.int32),
-    }
-    return q
+    """Zeroed quantized field arrays, shaped per FIELD_ORDER."""
+    return {name: np.zeros(shape, dtype=dtype) for name, dtype, shape in FIELD_ORDER}
 
 
 def test_hand_computed_evaluation():
     """All-zero weights with a known activation chain: every position
-    must evaluate to exactly 10000 mp.
+    must evaluate to exactly SCALE_OUTPUT mp.
 
-    Chain: acc = 0 (clamped from 0); h1 pre = bias = 4096 (1.0 in
-    64*64 units) -> act (4096 + 31) / 64 = 64; h2 pre = 64 * 8192
-    (w=1.0) = 524288 -> act 8192 (the >= clamp boundary); out =
-    8192 * 8192 (w=1.0) -> score = (8192 * 10000 + 4095) / 8192 = 10000.
+    Chain: acc = 0 (clamped from 0); h1 pre = bias = 1.0 (i.e.
+    SCALE_INPUT**2 in 64*64 units) -> act (SCALE_INPUT**2 + 31) / 64
+    = SCALE_INPUT; h2 pre = SCALE_INPUT * SCALE (w=1.0) -> act SCALE
+    (the >= clamp boundary); out = SCALE * SCALE (w=1.0) -> score =
+    (SCALE * SCALE_OUTPUT + 4095) / SCALE = SCALE_OUTPUT.
     """
     q = _zero_net()
-    q["hidden_layer_1_bias_q"][0] = 4096
-    q["hidden_layer_2_weights_q"][0, 0] = 8192  # 1.0
-    q["output_layer_weights_q"][0] = 8192  # 1.0
+    q["hidden_layer_1_bias_q"][0] = SCALE_INPUT * SCALE_INPUT  # 1.0
+    q["hidden_layer_2_weights_q"][0, 0] = SCALE  # 1.0
+    q["output_layer_weights_q"][0] = SCALE  # 1.0
     net = QuantizedNet.from_arrays(q)
     board = _board_from_epd("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -")
     fw, fb = _feats(board)
     score = net.evaluate(fw, fb, np.array([0]))
-    assert score[0] == 10000
+    assert score[0] == SCALE_OUTPUT
     # independent of the board
     board2 = _board_from_epd("4k3/8/8/8/8/8/8/R3K3 w - -")
     fw2, fb2 = _feats(board2)
-    assert net.evaluate(fw2, fb2, np.array([0]))[0] == 10000
+    assert net.evaluate(fw2, fb2, np.array([0]))[0] == SCALE_OUTPUT
 
 
 def test_hand_computed_accumulator():
@@ -102,7 +119,7 @@ def test_hand_computed_accumulator():
 
 def test_write_read_roundtrip(tmp_path):
     q = _zero_net()
-    q["input_layer_bias_q"] = np.arange(128, dtype=np.int16)
+    q["input_layer_bias_q"] = np.arange(ACCUMULATOR_SIZE, dtype=np.int16)
     q["output_layer_bias_q"] = np.array([12345], dtype=np.int32)
     path = tmp_path / "network.quant"
     n = write_network_quant(path, q)
@@ -143,39 +160,47 @@ def test_quantize_matches_int_arrays():
     """Quantizing float values v gives round(v * scale) ints."""
     rng = np.random.default_rng(0)
     float_params = {
-        "input_w": rng.normal(0, 0.02, (N_FEATURES, 128)),
-        "input_b": rng.normal(0, 0.02, 128),
-        "h1_w": rng.normal(0, 0.06, (256, 32)),
-        "h1_b": rng.normal(0, 0.1, 32),
-        "h2_w": rng.normal(0, 0.25, (32, 32)),
-        "h2_b": rng.normal(0, 0.1, 32),
-        "out_w": rng.normal(0, 0.05, 32),
+        "input_w": rng.normal(0, 0.02, (N_FEATURES, ACCUMULATOR_SIZE)),
+        "input_b": rng.normal(0, 0.02, ACCUMULATOR_SIZE),
+        "h1_w": rng.normal(0, 0.06, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
+        "h1_b": rng.normal(0, 0.1, HIDDEN_SIZE_1),
+        "h2_w": rng.normal(0, 0.25, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
+        "h2_b": rng.normal(0, 0.1, HIDDEN_SIZE_2),
+        "out_w": rng.normal(0, 0.05, HIDDEN_SIZE_2),
         "out_b": rng.normal(0, 0.05, 1),
     }
     q = quantize_parameters(float_params)
     assert (
         q["input_layer_weights_q"]
-        == np.round(float_params["input_w"] * 64).astype(np.int8)
+        == np.round(float_params["input_w"] * SCALE_INPUT).astype(np.int8)
     ).all()
     assert (
         q["input_layer_bias_q"]
-        == np.round(float_params["input_b"] * 64).astype(np.int16)
+        == np.round(float_params["input_b"] * SCALE_INPUT).astype(np.int16)
     ).all()
     assert (
         q["hidden_layer_1_weights_q"]
-        == np.round(float_params["h1_w"].T * 64).astype(np.int8)
+        == np.round(float_params["h1_w"].T * SCALE_INPUT).astype(np.int8)
     ).all()
     assert (
         q["hidden_layer_1_bias_q"]
-        == np.round(float_params["h1_b"] * 64 * 64).astype(np.int16)
+        == np.round(float_params["h1_b"] * SCALE_INPUT * SCALE_INPUT).astype(np.int16)
+    ).all()
+    assert (
+        q["hidden_layer_2_weights_q"]
+        == np.round(float_params["h2_w"].T * SCALE).astype(np.int16)
     ).all()
     assert (
         q["hidden_layer_2_bias_q"]
-        == np.round(float_params["h2_b"] * 8192 * 64).astype(np.int32)
+        == np.round(float_params["h2_b"] * SCALE * SCALE_INPUT).astype(np.int32)
+    ).all()
+    assert (
+        q["output_layer_weights_q"]
+        == np.round(float_params["out_w"] * SCALE).astype(np.int32)
     ).all()
     assert (
         q["output_layer_bias_q"]
-        == np.round(float_params["out_b"] * 8192 * 8192).astype(np.int32)
+        == np.round(float_params["out_b"] * SCALE * SCALE).astype(np.int32)
     ).all()
 
 

@@ -13,9 +13,9 @@ The network mirrors amy's C implementation (`src/neural_net.c`) exactly:
 
 | Stage | amy C | Python |
 |---|---|---|
-| Features | 45056 king-relative bit-planes: 10 piece types (5 own + 5 opponent) x 64 king squares x 64 squares, plus plane 10 (opponent king relative to own king), index `4096*tp + 64*king_sq + sq` / `40960 + 64*king_sq + opp_king_sq`, black side rank-flipped with `sq ^ 0x38` | `amy_training_nnue/features.py` |
-| Accumulator | per-side int16 vector of 128 (units of 1/64), clamped to `[0, 64]` at evaluation | `model.py` (float), `quantize.py` (int16) |
-| Network | 2x128 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 31) / 64` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
+| Features | 22528 king-relative features in a canonical frame per side: 10 piece types (5 own + 5 opponent) x 32 canonical king positions x 64 squares, plus plane 10 (opponent king relative to own king), index `2048*plane + 64*king_index + sq'`. Each frame is rank-flipped for black (`sq ^ 0x38`) and, if the own king stands on files e..h, mirrored horizontally (`sq ^ 0x07`), so the king is always in the left half; `king_index` = file + 4*rank of the canonical king (a1 = 0 ... d8 = 31) | `amy_training_nnue/features.py` |
+| Accumulator | per-side int16 vector of 256 (units of 1/64), clamped to `[0, 64]` at evaluation | `model.py` (float), `quantize.py` (int16) |
+| Network | 2x256 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 31) / 64` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
 | Output | `((out + 4095) / 8192) * 10000` then `(r + 4095) / 8192` -> millipawns, C truncating division | same, `quantize.py` |
 | Constants | `SCALE = 8192`, `SCALE_INPUT = 64`, `SCALE_INPUT_HALF = 31`, `SCALE_HALF = 4095`, `SCALE_OUTPUT = 10000` | identical |
 
@@ -27,7 +27,7 @@ uses `int8` x 64 weights with an `int16` x 64 x 64 bias (activations in
 bias (activations in [0, 8192]), and the output layer `int32` x 8192 /
 `int32` x 8192^2. `QuantizedNet` in `quantize.py` simulates that integer
 pipeline bit-exactly and is used to report quantized metrics. The file is
-5,778,008 bytes (20-byte header + fields).
+5,786,456 bytes (20-byte header + fields).
 
 ## Setup
 
@@ -62,20 +62,26 @@ Copy the produced `network.quant` into amy's working directory (next to the
 `Amy` binary) and it is picked up at startup.
 
 Training options of note: `--lr`, `--weight-decay`, `--val-fraction`,
-`--save-every N` (checkpoint cadence; every checkpoint is ~42 MB),
-`--resume <dir>` (continue from a float checkpoint),
-`--no-mirror-augment` (disable the dataset mirror augmentation that is
-on by default: positions where neither side has castling rights are
-trained on their horizontal mirror image as well, and positions with
-castling rights are duplicated, so the dataset doubles in size; a 10
-epochs / batch 2048 A/B on the full log cut quantized val rmse from
-375 to 265 mp).
+`--save-every N` (checkpoint cadence; every checkpoint is ~11.5 MB),
+`--resume <dir>` (continue from a float checkpoint). No dataset
+augmentation: with the canonical king-half frame, a position and its
+horizontal mirror image already produce identical feature vectors,
+so mirroring would only duplicate rows.
+
+Loss: MSE in tanh-squeezed space — the model output and the target
+(`score / 10000`) are both passed through `tanh` before the squared
+error, squeezing large score swings into (-1, 1).  For playing
+strength it matters more to capture the subtleties of about-even
+positions (eval near 0) than to predict large positive/negative scores
+accurately, and the tanh gradient focuses the network on that regime.
+Float-val metrics are measured in the same squeezed space.
 
 ## Data
 
 Input is amy's selfplay evaluation log: 40-byte BPD records
 (position + turn + score in millipawns, filtered by amy's
-`bpd_log_eval_diff_threshold`). Labels are `score / 10000` in model units.
+`bpd_log_eval_diff_threshold`). Labels are `score / 10000` in model
+units (tanh-squeezed in the loss).
 
 ## Verification
 
@@ -93,7 +99,7 @@ The Python pipeline is verified **bit-exact** against amy's C code:
 Regenerate the cross-check reference (needs the amy NNUE checkout):
 
 ```bash
-# in the amy checkout (feature/relative-king-positions):
+# in the amy checkout (feature/king-half-mirrored):
 make            # builds src/Amy and src/nn_crosscheck
 # then:
 python tools/make_crosscheck_reference.py [AMY_DIR]
@@ -102,7 +108,7 @@ python tools/make_crosscheck_reference.py [AMY_DIR]
 Run the full suite:
 
 ```bash
-python -m pytest tests/ -q   # 52 tests
+python -m pytest tests/ -q   # 47 tests
 ```
 
 ## Current results
@@ -110,7 +116,9 @@ python -m pytest tests/ -q   # 52 tests
 On the 3.28M-record selfplay log (`../amy/evaluation_log.bin`), 30 epochs,
 AdamW lr=1e-3, batch 2048, seed 0, on an M1 Pro. Metrics on the full log
 (`python -m amy_training_nnue evaluate`, 11-plane net with opponent-king
-plane 10):
+plane 10). *These numbers are from the previous (45056-feature,
+unmirrored) architecture; the net must be retrained on the king-half
+features.*
 
 ```
 quantized: rmse 213 mp, mae 152 mp, corr 0.9911, r2 0.9823, within 25cp 1.000
