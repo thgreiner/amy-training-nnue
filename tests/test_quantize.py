@@ -48,7 +48,7 @@ def test_header_matches_c_struct():
     """The header must be byte-identical to C's WeightsHeader
     (neural_net.c): u32 magic, 4 x u16 architecture sizes, then one
     u8 quantization code per field (1 = int8, 2 = int16, 3 = int32)
-    in FIELD_ORDER order: 1 2 1 2 2 3 3 3."""
+    in FIELD_ORDER order: 1 2 2 3 2 3 3 3."""
     header = weights_header()
     assert len(header) == HEADER_SIZE == 20
     assert header == struct.pack(
@@ -60,8 +60,8 @@ def test_header_matches_c_struct():
         HIDDEN_SIZE_2,
         1,
         2,
-        1,
         2,
+        3,
         2,
         3,
         3,
@@ -79,13 +79,13 @@ def test_hand_computed_evaluation():
     must evaluate to exactly SCALE_OUTPUT mp.
 
     Chain: acc = 0 (clamped from 0); h1 pre = bias = 1.0 (i.e.
-    SCALE_INPUT**2 in 64*64 units) -> act (SCALE_INPUT**2 + 31) / 64
+    SCALE_H1 in 64*8192 units) -> act (SCALE_H1 + 4095) / 8192
     = SCALE_INPUT; h2 pre = SCALE_INPUT * SCALE (w=1.0) -> act SCALE
     (the >= clamp boundary); out = SCALE * SCALE (w=1.0) -> score =
     (SCALE * SCALE_OUTPUT + 4095) / SCALE = SCALE_OUTPUT.
     """
     q = _zero_net()
-    q["hidden_layer_1_bias_q"][0] = SCALE_INPUT * SCALE_INPUT  # 1.0
+    q["hidden_layer_1_bias_q"][0] = SCALE_INPUT * SCALE  # 1.0
     q["hidden_layer_2_weights_q"][0, 0] = SCALE  # 1.0
     q["output_layer_weights_q"][0] = SCALE  # 1.0
     net = QuantizedNet.from_arrays(q)
@@ -180,11 +180,11 @@ def test_quantize_matches_int_arrays():
     ).all()
     assert (
         q["hidden_layer_1_weights_q"]
-        == np.round(float_params["h1_w"].T * SCALE_INPUT).astype(np.int8)
+        == np.round(float_params["h1_w"].T * SCALE).astype(np.int16)
     ).all()
     assert (
         q["hidden_layer_1_bias_q"]
-        == np.round(float_params["h1_b"] * SCALE_INPUT * SCALE_INPUT).astype(np.int16)
+        == np.round(float_params["h1_b"] * SCALE_INPUT * SCALE).astype(np.int32)
     ).all()
     assert (
         q["hidden_layer_2_weights_q"]

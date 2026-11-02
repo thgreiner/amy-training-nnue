@@ -15,8 +15,8 @@ from .features import feature_indices
 
 # Maximum number of active input features per accumulator.  A position
 # has at most 15 own + 15 opponent non-king pieces (30 for a full
-# board) plus one opponent-king plane: 31.  33 leaves headroom.
-MAX_FEATURES = 33
+# board); the kings are not features.  32 leaves headroom.
+MAX_FEATURES = 32
 
 
 class BpdDataset:

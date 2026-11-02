@@ -172,11 +172,11 @@ def main(argv=None) -> int:
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument(
         "--weight-bound",
         type=float,
-        default=1.0,
+        default=1.9,
         help="keep weight tensors (not biases) within [-B, B] each step; 0 disables",
     )
     p.add_argument("--val-fraction", type=float, default=0.1)

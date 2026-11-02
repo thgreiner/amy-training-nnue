@@ -4,10 +4,10 @@ evaluate it with the exact integer arithmetic of neural_net.c.
 network.quant is a 20-byte little-endian header (the WeightsHeader
 struct of neural_net.c, see weights_header()) followed by, in order:
 
-    input_layer_weights_q  int8   [22528][ACCUMULATOR_SIZE]
+    input_layer_weights_q  int8   [20480][ACCUMULATOR_SIZE]
     input_layer_bias_q     int16  [ACCUMULATOR_SIZE]
-    hidden_layer_1_weights_q int8 [HIDDEN_SIZE_1][512]
-    hidden_layer_1_bias_q  int16  [HIDDEN_SIZE_1]
+    hidden_layer_1_weights_q int16 [HIDDEN_SIZE_1][512]
+    hidden_layer_1_bias_q  int32  [HIDDEN_SIZE_1]
     hidden_layer_2_weights_q int16 [HIDDEN_SIZE_2][HIDDEN_SIZE_1]
     hidden_layer_2_bias_q  int32  [HIDDEN_SIZE_2]
     output_layer_weights_q int32  [HIDDEN_SIZE_2]
@@ -17,22 +17,22 @@ Quantization convention (float v -> fixed point):
 
     input weights:  int8(v * 64); the accumulator is kept in 1/64 units
     input bias:     int16(v * 64)
-    hidden 1:       int8(v * 64) weights, int16(v * 64 * 64) bias;
-                    sum in 64*64 units, +31 then /64 -> acts in [0, 64]
+    hidden 1:       int16(v * 8192) weights, int32(v * 64 * 8192) bias;
+                    sum in 64*8192 units, +4095 then /8192 -> acts in [0, 64]
     hidden 2:       int16(v * 8192) weights, int32(v * 8192 * 64) bias;
                     sum in 8192*64 units, +31 then /64 -> acts in [0, 8192]
     output:         int32(v * 8192) weights, int32(v * 8192 * 8192) bias
 
-The int8 layers cover float magnitude 2.0 at scale 64 (weights are kept
-within [-1, 1] during training, so no clipping in practice); the int16
-hidden 1 bias at scale 4096 covers +-8.0.  Out-of-range values are
-clipped (with a warning) so the file stays loadable by amy.
+The int8 input weights cover float magnitude 2.0 at scale 64 (weights
+are kept within [-1, 1] during training, so no clipping in practice);
+the int16 hidden 1 weights at scale 8192 cover +-4.0.  Out-of-range
+values are clipped (with a warning) so the file stays loadable by amy.
 
 The header (little-endian, 20 bytes, must match neural_net.c's
 WeightsHeader byte-for-byte):
 
     u32 magic 0x57594D41 (file bytes read as "AMYW")
-    u16 accumulator size, u16 number of input features (22528),
+    u16 accumulator size, u16 number of input features (20480),
     u16 hidden layer 1 size, u16 hidden layer 2 size
     8 x u8 quantization codes (1 = int8, 2 = int16, 3 = int32), one per
     field, in the same order as the fields above
@@ -55,13 +55,16 @@ SCALE_INPUT = 64  # input/hidden-1 scale; accumulator in 1/64 units
 SCALE_INPUT_HALF = SCALE_INPUT // 2 - 1  # 31, as in neural_net.c
 SCALE_HALF = SCALE // 2 - 1  # 4095, as in neural_net.c
 SCALE_OUTPUT = 10000  # score_mp = round(output * SCALE_OUTPUT)
+# Hidden-1 fixed-point scale (SCALE_H1 in neural_net.c): acc @ 64 x
+# int16 weights @ 8192, and the int32 hidden-1 bias.
+SCALE_H1 = SCALE_INPUT * SCALE  # 524288
 
 FIELD_ORDER = [
     # (name, numpy dtype, shape)
     ("input_layer_weights_q", np.int8, (N_FEATURES, ACCUMULATOR_SIZE)),
     ("input_layer_bias_q", np.int16, (ACCUMULATOR_SIZE,)),
-    ("hidden_layer_1_weights_q", np.int8, (HIDDEN_SIZE_1, 2 * ACCUMULATOR_SIZE)),
-    ("hidden_layer_1_bias_q", np.int16, (HIDDEN_SIZE_1,)),
+    ("hidden_layer_1_weights_q", np.int16, (HIDDEN_SIZE_1, 2 * ACCUMULATOR_SIZE)),
+    ("hidden_layer_1_bias_q", np.int32, (HIDDEN_SIZE_1,)),
     ("hidden_layer_2_weights_q", np.int16, (HIDDEN_SIZE_2, HIDDEN_SIZE_1)),
     ("hidden_layer_2_bias_q", np.int32, (HIDDEN_SIZE_2,)),
     ("output_layer_weights_q", np.int32, (HIDDEN_SIZE_2,)),
@@ -139,9 +142,9 @@ def quantize_parameters(params: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return {
         "input_layer_weights_q": _quantize(params["input_w"], SCALE_INPUT, np.int8),
         "input_layer_bias_q": _quantize(params["input_b"], SCALE_INPUT, np.int16),
-        "hidden_layer_1_weights_q": _quantize(params["h1_w"].T, SCALE_INPUT, np.int8),
+        "hidden_layer_1_weights_q": _quantize(params["h1_w"].T, SCALE, np.int16),
         "hidden_layer_1_bias_q": _quantize(
-            params["h1_b"], SCALE_INPUT * SCALE_INPUT, np.int16
+            params["h1_b"], SCALE_INPUT * SCALE, np.int32
         ),
         "hidden_layer_2_weights_q": _quantize(params["h2_w"].T, SCALE, np.int16),
         "hidden_layer_2_bias_q": _quantize(
@@ -220,8 +223,8 @@ class QuantizedNet:
 
     input_w: np.ndarray  # int8 (N_FEATURES, ACCUMULATOR_SIZE), scale 64
     input_b: np.ndarray  # int16 (ACCUMULATOR_SIZE,), scale 64
-    h1_w: np.ndarray  # int8 (HIDDEN_SIZE_1, 2*ACC), scale 64
-    h1_b: np.ndarray  # int16 (HIDDEN_SIZE_1,), scale 64*64
+    h1_w: np.ndarray  # int16 (HIDDEN_SIZE_1, 2*ACC), scale 8192
+    h1_b: np.ndarray  # int32 (HIDDEN_SIZE_1,), scale 64*8192
     h2_w: np.ndarray  # int16 (HIDDEN_SIZE_2, HIDDEN_SIZE_1), scale 8192
     h2_b: np.ndarray  # int32 (HIDDEN_SIZE_2,), scale 8192*64
     out_w: np.ndarray  # int32 (HIDDEN_SIZE_2,)
@@ -293,12 +296,14 @@ class QuantizedNet:
         # stored accumulators stay raw int16), in 1/64 units.
         acc = np.clip(acc, 0, SCALE_INPUT)
 
-        h1 = (self.h1_w @ acc.T).T + self.h1_b  # int32 (n, HIDDEN_SIZE_1), 64*64 units
+        h1 = (
+            self.h1_w @ acc.T
+        ).T + self.h1_b  # int32 (n, HIDDEN_SIZE_1), 64*8192 units
         h1 = np.where(h1 <= 0, 0, h1)
         h1 = np.where(
-            h1 > SCALE_INPUT * SCALE_INPUT,
+            h1 > SCALE_H1,
             SCALE_INPUT,
-            (h1 + SCALE_INPUT_HALF) // SCALE_INPUT,
+            (h1 + SCALE_HALF) // SCALE,
         )
         h1 = h1.astype(np.int32)
 

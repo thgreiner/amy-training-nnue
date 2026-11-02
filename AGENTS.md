@@ -17,12 +17,13 @@ emits the `network.quant` file amy loads at startup.
 - The pipeline works in **1/64 units** from the accumulator through
   hidden layer 1: input bias int16 @ 64, input weights int8 @ 64 (the hot
   loop is a plain `int16 += int8`, no per-feature rescale), h1 weights
-  int8 @ 64 with an int16 @ 64*64 bias (sum in 64*64 units), h2 weights
-  int16 @ 8192 with an int32 @ 8192*64 bias (sum in 8192*64 units).  The
-  conversion to the 8192 units the output transform expects is two `/64`
-  divisions with `+31` rounding.
-- Clamped ReLU: h1: `h = 0` if `q <= 0`, else `64` if `q > 64*64`
-  (strict `>`), else `trunc((q + 31) / 64)`.  h2: `h = 0` if `q <= 0`,
+  int16 @ 8192 with an int32 @ 64*8192 bias (sum in 64*8192 units), h2
+  weights int16 @ 8192 with an int32 @ 8192*64 bias (sum in 8192*64
+  units).  The sums are converted to the 64 / 8192 units of the
+  activations (h1 in `[0, 64]`, h2 in `[0, 8192]`) by
+  `trunc((q + 4095) / 8192)` for h1 and `trunc((q + 31) / 64)` for h2.
+- Clamped ReLU: h1: `h = 0` if `q <= 0`, else `64` if `q > 64*8192`
+  (strict `>`), else `trunc((q + 4095) / 8192)`.  h2: `h = 0` if `q <= 0`,
   else `8192` if `q >= 8192*64` (`>=`), else `trunc((q + 31) / 64)` —
   match the C per layer.
 - Integer division **truncates toward zero** (C), not floor (Python).
@@ -37,13 +38,13 @@ emits the `network.quant` file amy loads at startup.
   commute.  A position and its horizontal mirror image therefore produce
   identical feature vectors.
 - Feature index: `2048 * plane + 64 * king_index + sq'`, planes 0..4 =
-  own P N B R Q, 5..9 = opponent P N B R Q, plane 10 = opponent king
-  relative to own king (always active; see
-  `nn_build_accumulator()` in neural_net.c).  `king_index` = file +
-  4 * rank of the canonical own king (0..31: a1 = 0 ... d1 = 3, ...
-  a8 = 28 ... d8 = 31); `sq'` is the piece square in the same frame
-  (pieces are not restricted to the left half, only the king).
-  N_FEATURES = 11 * 32 * 64 = 22528.
+  own P N B R Q, 5..9 = opponent P N B R Q (the kings are *not*
+  features; they only define the frame; see `nn_build_accumulator()`
+  in neural_net.c).  `king_index` = file + 4 * rank of the canonical
+  own king (0..31: a1 = 0 ... d1 = 3, ... a8 = 28 ... d8 = 31);
+  `sq'` is the piece square in the same frame (pieces are not
+  restricted to the left half, only the king).  N_FEATURES =
+  10 * 32 * 64 = 20480.
 
 Any change to the pipeline must be re-validated:
 
@@ -104,10 +105,12 @@ do not hand-roll nibble extraction.
 - Keep the `network.quant` export byte-identical to amy's layout: a
   20-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
   bytes read as "AMYW",
-  then accumulator size 256, number of input features 22528, hidden
+  then accumulator size 256, number of input features 20480, hidden
   layer sizes 32/32, per-field quantization codes 1/2/3 =
-  int8/16/32; see `weights_header()`) followed by 5,786,436 bytes of
-  fields in `write_network_quant`'s order (5,786,456 bytes total).
+  int8/16/32 — input weights 1, input bias 2, h1 weights 2, h1 bias 3,
+  h2 weights 2, h2 bias 3, output weights 3, output bias 3; see
+  `weights_header()`) followed by 5,278,596 bytes of fields in
+  `write_network_quant`'s order (5,278,616 bytes total).
 - Style: `black` + `isort` (configured in `pyproject.toml`).
 - Data lives in `../amy/evaluation_log.bin` (grows with every selfplay
   session — tests must not read it). `tests/data/selfplay_sample.bin` is
@@ -122,8 +125,7 @@ do not hand-roll nibble extraction.
 amy_training_nnue/
   bpd.py       40-byte record parse/encode, validation
   position.py  Position dataclass, EPD, nibble helpers
-  features.py  king-relative feature indices incl. opponent-king plane
-               (must match neural_net.c)
+  features.py  king-relative feature indices (must match neural_net.c)
   dataset.py   BPD -> padded feature tensors + targets
   model.py     NnueNet (MLX float)
   quantize.py  QuantizedNet (int simulation), network.quant I/O

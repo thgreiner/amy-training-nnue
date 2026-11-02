@@ -13,11 +13,10 @@ a canonical frame per side.  Each side's own king defines the frame:
    image produce the *same* feature vectors for both sides.
 
 There are 10 piece types (0..4 = own pawn..queen, 5..9 = opponent
-pawn..queen; the kings are *not* piece features), 32 canonical own
-king positions, 64 piece squares, and plane 10 for the opponent king
-relative to own king:
+pawn..queen; the kings are *not* piece features, they only define the
+frame), 32 canonical own king positions, and 64 piece squares:
 
-    N_FEATURES = 11 * 32 * 64 = 22528
+    N_FEATURES = 10 * 32 * 64 = 20480
     index = 2048 * plane + 64 * king_index + sq'
 
 with ``sq'`` the piece square in the side's canonical frame (0..63;
@@ -40,8 +39,9 @@ import numpy as np
 from .bpd import BLACK, WHITE
 
 N_PIECE_TYPES = 10
-# 10 piece-type planes plus the opponent-king plane (plane 10).
-N_FEATURES = 11 * 32 * 64  # 22528
+# One plane per piece type (0..4 own pawn..queen, 5..9 opponent
+# pawn..queen); the kings are not features, they define the frame.
+N_FEATURES = 10 * 32 * 64  # 20480
 ACCUMULATOR_SIZE = 256
 HIDDEN_SIZE_1 = 32
 HIDDEN_SIZE_2 = 32
@@ -77,10 +77,9 @@ def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return (white_accumulator_indices, black_accumulator_indices).
 
     ``board`` is a 64-element int8 array as in BpdRecord.board().
-    Each returned array holds the 22528-space index of every active
-    feature of that side's accumulator (typically 31 entries: 15 own
-    and 15 opponent pieces, kings excluded, plus the opponent-king
-    plane).
+    Each returned array holds the 20480-space index of every active
+    feature of that side's accumulator (up to 30 entries: 15 own and
+    15 opponent pieces, kings excluded).
     """
     if (board == 6).sum() != 1 or (board == -6).sum() != 1:
         raise ValueError("board must contain exactly one king per side")
@@ -105,7 +104,4 @@ def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             if t < QUEEN:
                 black.append(PLANE_SIZE * t + 64 * b_king + (sq ^ b_flip))
                 white.append(PLANE_SIZE * (t + 5) + 64 * w_king + (sq ^ w_flip))
-    # Plane 10: opponent king relative to own king (nn_build_accumulator).
-    white.append(PLANE_SIZE * 10 + 64 * w_king + (black_king ^ w_flip))
-    black.append(PLANE_SIZE * 10 + 64 * b_king + (white_king ^ b_flip))
     return (np.asarray(white, dtype=np.int32), np.asarray(black, dtype=np.int32))

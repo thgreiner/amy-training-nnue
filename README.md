@@ -3,7 +3,7 @@
 Training application for amy's NNUE evaluation function.
 
 Trains the weights of the neural network used by amy's
-`feature/relative-king-positions` branch from amy selfplay data in
+`feature/king-half-mirrored` branch from amy selfplay data in
 [BPD format](https://github.com/thgreiner/amy), and exports the raw
 `network.quant` weight file that amy loads at startup.
 
@@ -13,21 +13,21 @@ The network mirrors amy's C implementation (`src/neural_net.c`) exactly:
 
 | Stage | amy C | Python |
 |---|---|---|
-| Features | 22528 king-relative features in a canonical frame per side: 10 piece types (5 own + 5 opponent) x 32 canonical king positions x 64 squares, plus plane 10 (opponent king relative to own king), index `2048*plane + 64*king_index + sq'`. Each frame is rank-flipped for black (`sq ^ 0x38`) and, if the own king stands on files e..h, mirrored horizontally (`sq ^ 0x07`), so the king is always in the left half; `king_index` = file + 4*rank of the canonical king (a1 = 0 ... d8 = 31) | `amy_training_nnue/features.py` |
+| Features | 20480 king-relative features in a canonical frame per side: 10 piece types (5 own + 5 opponent) x 32 canonical king positions x 64 squares, index `2048*plane + 64*king_index + sq'`; the kings are not features, they only define the frame. Each frame is rank-flipped for black (`sq ^ 0x38`) and, if the own king stands on files e..h, mirrored horizontally (`sq ^ 0x07`), so the king is always in the left half; `king_index` = file + 4*rank of the canonical king (a1 = 0 ... d8 = 31) | `amy_training_nnue/features.py` |
 | Accumulator | per-side int16 vector of 256 (units of 1/64), clamped to `[0, 64]` at evaluation | `model.py` (float), `quantize.py` (int16) |
-| Network | 2x256 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 31) / 64` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
+| Network | 2x256 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 4095) / 8192` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
 | Output | `((out + 4095) / 8192) * 10000` then `(r + 4095) / 8192` -> millipawns, C truncating division | same, `quantize.py` |
-| Constants | `SCALE = 8192`, `SCALE_INPUT = 64`, `SCALE_INPUT_HALF = 31`, `SCALE_HALF = 4095`, `SCALE_OUTPUT = 10000` | identical |
+| Constants | `SCALE = 8192`, `SCALE_INPUT = 64`, `SCALE_INPUT_HALF = 31`, `SCALE_H1 = 524288`, `SCALE_HALF = 4095`, `SCALE_OUTPUT = 10000` | identical |
 
 Training happens in floating point (MLX, `NnueNet`), then the parameters are
 quantized into the exact integer pipeline amy runs: the accumulator is kept
 in 1/64 units (input weights `int8` x 64, input bias `int16` x 64), hidden 1
-uses `int8` x 64 weights with an `int16` x 64 x 64 bias (activations in
+uses `int16` x 8192 weights with an `int32` x 64 x 8192 bias (activations in
 [0, 64]), hidden 2 uses `int16` x 8192 weights with an `int32` x 8192 x 64
 bias (activations in [0, 8192]), and the output layer `int32` x 8192 /
 `int32` x 8192^2. `QuantizedNet` in `quantize.py` simulates that integer
 pipeline bit-exactly and is used to report quantized metrics. The file is
-5,786,456 bytes (20-byte header + fields).
+5,278,616 bytes (20-byte header + fields).
 
 ## Setup
 
@@ -115,10 +115,10 @@ python -m pytest tests/ -q   # 47 tests
 
 On the 3.28M-record selfplay log (`../amy/evaluation_log.bin`), 30 epochs,
 AdamW lr=1e-3, batch 2048, seed 0, on an M1 Pro. Metrics on the full log
-(`python -m amy_training_nnue evaluate`, 11-plane net with opponent-king
-plane 10). *These numbers are from the previous (45056-feature,
-unmirrored) architecture; the net must be retrained on the king-half
-features.*
+(`python -m amy_training_nnue evaluate`, 10-plane net). *These numbers
+are from the previous (45056-feature, unmirrored) architecture; the net
+must be retrained on the current 20480-feature king-half features (no
+opponent-king plane) and the new hidden-1 quantization.*
 
 ```
 quantized: rmse 213 mp, mae 152 mp, corr 0.9911, r2 0.9823, within 25cp 1.000

@@ -2,7 +2,7 @@
 
 tests/data/crosscheck_reference.json holds the accumulators and scores
 produced by amy's own neural_net.c (branch
-feature/relative-king-positions, src/nn_crosscheck.c) for a random
+feature/king-half-mirrored, src/nn_crosscheck.c) for a random
 in-range network generated with a fixed seed.  The Python
 QuantizedNet must reproduce every value, including int16 wrap-around,
 the [0, 64] and [0, 8192] clamps, and the two-step rounded output
