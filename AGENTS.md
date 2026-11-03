@@ -16,7 +16,9 @@ emits the `network.quant` file amy loads at startup.
   local copy at evaluation time).
 - The pipeline works in **1/64 units** from the accumulator through
   hidden layer 1: input bias int16 @ 64, input weights int8 @ 64 (the hot
-  loop is a plain `int16 += int8`, no per-feature rescale), h1 weights
+  loop is a plain `int16 += int8`, no per-feature rescale), plus — for
+  each active pawn pair — the shared pawn weight row int8 @ 64 (same
+  `int16 += int8` add, one row for each side's accumulator); h1 weights
   int16 @ 8192 with an int32 @ 64*8192 bias (sum in 64*8192 units), h2
   weights int16 @ 8192 with an int32 @ 8192*64 bias (sum in 8192*64
   units).  The sums are converted to the 64 / 8192 units of the
@@ -45,10 +47,25 @@ emits the `network.quant` file amy loads at startup.
   `sq'` is the piece square in the same frame (pieces are not
   restricted to the left half, only the king).  N_FEATURES =
   10 * 32 * 64 = 20480.
+- Pawn pair features (see `nn_init_pawns()` in neural_net.c): every
+  unordered pair of pawns within one file of distance (same file, any
+  rank, or adjacent files) contributes one row of a *shared*
+  N_PAWN_FEATURES x ACCUMULATOR_SIZE int8 matrix (4560 x 256, one row
+  per unordered pair of the 96 color-square ids; both sides read the
+  same matrix, but each pair is indexed in that side's own canonical
+  frame, where white pawns have color 0 and black pawns 1 — swapped for
+  black).  Id per pawn: `color * 48 + (sq' - 8)` (ranks 2..7 only —
+  positions with pawns on rank 1 or 8 must not be fed to the pipeline,
+  and bpd.py rejects them); pair index: combadic `hi * (hi - 1) / 2 +
+  lo` (hi = max, lo = min), in 0..4559.  Only 1488 of the 4560 rows are
+  ever active (the rest may hold zeros); both sides get the same pair
+  *set*, mapped through their own frame.  Worked example (starting
+  position): (b2, a2) is index 27 in the white frame (ids 6/7) and
+  index 4559 in the black frame (ids 94/95, colors swapped).
 
 Any change to the pipeline must be re-validated:
 
-1. `python -m pytest tests/ -q` — 47 tests, including
+1. `python -m pytest tests/ -q` — 57 tests, including
    `tests/test_crosscheck.py`, which compares against C ground truth stored
    in `tests/data/crosscheck_reference.json` (regenerate with
    `python tools/make_crosscheck_reference.py [AMY_DIR]`, which needs
@@ -64,7 +81,9 @@ of `pos[sq >> 4]`), u64 castling/EP specials, i32 score (millipawns,
 white perspective), u8 turn, padding. Nibbles: 0 empty, 1-7 white
 P..K, 8-14 black P..K, 5/12 also mark castling rooks (position-dependent),
 15 = EP target square. Use `Position.epd()` / `position_from_record()` —
-do not hand-roll nibble extraction.
+do not hand-roll nibble extraction. `BpdRecord.validate()` rejects
+positions with pawns on rank 1 or 8: the pawn pair feature index
+(`sq' - 8`) would run out of bounds, as in the engine.
 
 ## MLX notes (version-specific gotchas)
 
@@ -103,14 +122,20 @@ do not hand-roll nibble extraction.
   has been removed.  `mirror_board` in position.py remains available for
   tests (e.g. the mirror-folding invariant in test_features.py).
 - Keep the `network.quant` export byte-identical to amy's layout: a
-  20-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
+  24-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
   bytes read as "AMYW",
-  then accumulator size 256, number of input features 20480, hidden
-  layer sizes 32/32, per-field quantization codes 1/2/3 =
-  int8/16/32 — input weights 1, input bias 2, h1 weights 2, h1 bias 3,
-  h2 weights 2, h2 bias 3, output weights 3, output bias 3; see
-  `weights_header()`) followed by 5,278,596 bytes of fields in
-  `write_network_quant`'s order (5,278,616 bytes total).
+  then accumulator size 256, number of piece input features 20480,
+  number of pawn input features 4560, hidden layer sizes 32/32,
+  per-field quantization codes 1/2/3 = int8/16/32 — input weights 1,
+  input bias 2, h1 weights 2, h1 bias 3, h2 weights 2, h2 bias 3,
+  output weights 3, output bias 3; the pawn weights have *no* code and
+  are read unconditionally as int8.  See `weights_header()`.  The C
+  struct is 22 field bytes + 2 trailing padding — pack with
+  `struct.pack("<IHHHHH8B2x", ...)`, a 22-byte pack silently
+  misaligns the whole file) followed by 6,445,956 bytes of fields in
+  `write_network_quant`'s order (6,445,980 bytes total): piece input
+  weights, the shared 4560 x 256 int8 pawn block, input bias, hidden
+  and output layers.
 - Style: `black` + `isort` (configured in `pyproject.toml`).
 - Data lives in `../amy/evaluation_log.bin` (grows with every selfplay
   session — tests must not read it). `tests/data/selfplay_sample.bin` is
@@ -125,7 +150,8 @@ do not hand-roll nibble extraction.
 amy_training_nnue/
   bpd.py       40-byte record parse/encode, validation
   position.py  Position dataclass, EPD, nibble helpers
-  features.py  king-relative feature indices (must match neural_net.c)
+  features.py  king-relative feature indices + pawn pair indices
+               (must match neural_net.c)
   dataset.py   BPD -> padded feature tensors + targets
   model.py     NnueNet (MLX float)
   quantize.py  QuantizedNet (int simulation), network.quant I/O

@@ -1,10 +1,11 @@
 """Quantize a trained float network to amy's network.quant format and
 evaluate it with the exact integer arithmetic of neural_net.c.
 
-network.quant is a 20-byte little-endian header (the WeightsHeader
+network.quant is a 24-byte little-endian header (the WeightsHeader
 struct of neural_net.c, see weights_header()) followed by, in order:
 
-    input_layer_weights_q  int8   [20480][ACCUMULATOR_SIZE]
+    input_layer_weights_q  int8   [N_FEATURES][ACCUMULATOR_SIZE]
+    input_pawn_weights_q   int8   [N_PAWN_FEATURES][ACCUMULATOR_SIZE]
     input_layer_bias_q     int16  [ACCUMULATOR_SIZE]
     hidden_layer_1_weights_q int16 [HIDDEN_SIZE_1][512]
     hidden_layer_1_bias_q  int32  [HIDDEN_SIZE_1]
@@ -13,9 +14,14 @@ struct of neural_net.c, see weights_header()) followed by, in order:
     output_layer_weights_q int32  [HIDDEN_SIZE_2]
     output_layer_bias_q    int32  [1]
 
+The pawn weights have no quantization code in the header; the engine
+unconditionally reads them as int8 at the same scale as the piece input
+weights (3072 of the 4560 rows are never active and hold zeros).
+
 Quantization convention (float v -> fixed point):
 
     input weights:  int8(v * 64); the accumulator is kept in 1/64 units
+    pawn weights:   int8(v * 64); same scale, same accumulator-add
     input bias:     int16(v * 64)
     hidden 1:       int16(v * 8192) weights, int32(v * 64 * 8192) bias;
                     sum in 64*8192 units, +4095 then /8192 -> acts in [0, 64]
@@ -28,14 +34,17 @@ are kept within [-1, 1] during training, so no clipping in practice);
 the int16 hidden 1 weights at scale 8192 cover +-4.0.  Out-of-range
 values are clipped (with a warning) so the file stays loadable by amy.
 
-The header (little-endian, 20 bytes, must match neural_net.c's
+The header (little-endian, 24 bytes, must match neural_net.c's
 WeightsHeader byte-for-byte):
 
     u32 magic 0x57594D41 (file bytes read as "AMYW")
-    u16 accumulator size, u16 number of input features (20480),
+    u16 accumulator size, u16 number of piece input features (20480),
+    u16 number of pawn input features (4560),
     u16 hidden layer 1 size, u16 hidden layer 2 size
     8 x u8 quantization codes (1 = int8, 2 = int16, 3 = int32), one per
-    field, in the same order as the fields above
+    piece field, in the same order as the fields above
+    2 bytes of struct padding (the C struct is 24 bytes: 22 field bytes
+    + 2 trailing padding; write zeros, never read)
 """
 
 from __future__ import annotations
@@ -48,7 +57,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .features import ACCUMULATOR_SIZE, HIDDEN_SIZE_1, HIDDEN_SIZE_2, N_FEATURES
+from .features import (
+    ACCUMULATOR_SIZE,
+    HIDDEN_SIZE_1,
+    HIDDEN_SIZE_2,
+    N_FEATURES,
+    N_PAWN_FEATURES,
+)
 
 SCALE = 8192
 SCALE_INPUT = 64  # input/hidden-1 scale; accumulator in 1/64 units
@@ -62,6 +77,7 @@ SCALE_H1 = SCALE_INPUT * SCALE  # 524288
 FIELD_ORDER = [
     # (name, numpy dtype, shape)
     ("input_layer_weights_q", np.int8, (N_FEATURES, ACCUMULATOR_SIZE)),
+    ("input_pawn_weights_q", np.int8, (N_PAWN_FEATURES, ACCUMULATOR_SIZE)),
     ("input_layer_bias_q", np.int16, (ACCUMULATOR_SIZE,)),
     ("hidden_layer_1_weights_q", np.int16, (HIDDEN_SIZE_1, 2 * ACCUMULATOR_SIZE)),
     ("hidden_layer_1_bias_q", np.int32, (HIDDEN_SIZE_1,)),
@@ -71,14 +87,15 @@ FIELD_ORDER = [
     ("output_layer_bias_q", np.int32, (1,)),
 ]
 
-# WeightsHeader of neural_net.c (little-endian, 20 bytes, no padding).
+# WeightsHeader of neural_net.c (little-endian, 24 bytes: 22 field
+# bytes + 2 trailing struct padding, matching the C struct layout).
 WEIGHTS_HEADER_MAGIC = 0x57594D41  # file bytes read as "AMYW"
 QUANT_INT8 = 1
 QUANT_INT16 = 2
 QUANT_INT32 = 3
-# u32 magic, 4 x u16 sizes (accumulator, num features, h1, h2),
-# 8 x u8 quant codes.
-HEADER_FORMAT = "<IHHHH8B"
+# u32 magic, 5 x u16 sizes (accumulator, piece features, pawn
+# features, h1, h2), 8 x u8 quant codes, 2 padding bytes.
+HEADER_FORMAT = "<IHHHHH8B2x"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 _QUANT_CODES = {
@@ -89,17 +106,26 @@ _QUANT_CODES = {
 
 
 def _header_quant_codes() -> list[int]:
-    """The 8 header quantization codes, one per FIELD_ORDER entry."""
-    return [_QUANT_CODES[np.dtype(dtype).name] for _, dtype, _ in FIELD_ORDER]
+    """The 8 header quantization codes, one per FIELD_ORDER entry.
+
+    The pawn weights have no code in the C header: the engine reads
+    them unconditionally as int8 at the input scale.
+    """
+    return [
+        _QUANT_CODES[np.dtype(dtype).name]
+        for name, dtype, _ in FIELD_ORDER
+        if name != "input_pawn_weights_q"
+    ]
 
 
 def weights_header() -> bytes:
-    """The 20-byte WeightsHeader of neural_net.c for this architecture."""
+    """The 24-byte WeightsHeader of neural_net.c for this architecture."""
     return struct.pack(
         HEADER_FORMAT,
         WEIGHTS_HEADER_MAGIC,
         ACCUMULATOR_SIZE,
         N_FEATURES,
+        N_PAWN_FEATURES,
         HIDDEN_SIZE_1,
         HIDDEN_SIZE_2,
         *_header_quant_codes(),
@@ -141,6 +167,7 @@ def quantize_parameters(params: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """
     return {
         "input_layer_weights_q": _quantize(params["input_w"], SCALE_INPUT, np.int8),
+        "input_pawn_weights_q": _quantize(params["pawn_w"], SCALE_INPUT, np.int8),
         "input_layer_bias_q": _quantize(params["input_b"], SCALE_INPUT, np.int16),
         "hidden_layer_1_weights_q": _quantize(params["h1_w"].T, SCALE, np.int16),
         "hidden_layer_1_bias_q": _quantize(
@@ -178,22 +205,23 @@ def read_network_quant(path: str | Path) -> dict[str, np.ndarray]:
         raise ValueError(
             f"{path}: size {len(data)} != expected {NETWORK_QUANT_SIZE} bytes"
         )
-    magic, acc_size, num_features, h1_size, h2_size, *codes = struct.unpack_from(
-        HEADER_FORMAT, data
+    magic, acc_size, num_features, pawn_features, h1_size, h2_size, *codes = (
+        struct.unpack_from(HEADER_FORMAT, data)
     )
     if magic != WEIGHTS_HEADER_MAGIC:
         raise ValueError(
             f"{path}: bad magic {magic:#010x}, expected {WEIGHTS_HEADER_MAGIC:#010x}"
         )
-    if (acc_size, num_features, h1_size, h2_size) != (
+    if (acc_size, num_features, pawn_features, h1_size, h2_size) != (
         ACCUMULATOR_SIZE,
         N_FEATURES,
+        N_PAWN_FEATURES,
         HIDDEN_SIZE_1,
         HIDDEN_SIZE_2,
     ):
         raise ValueError(
-            f"{path}: header sizes {(acc_size, num_features, h1_size, h2_size)} != "
-            f"({ACCUMULATOR_SIZE}, {N_FEATURES}, {HIDDEN_SIZE_1}, {HIDDEN_SIZE_2}) "
+            f"{path}: header sizes {(acc_size, num_features, pawn_features, h1_size, h2_size)} != "
+            f"({ACCUMULATOR_SIZE}, {N_FEATURES}, {N_PAWN_FEATURES}, {HIDDEN_SIZE_1}, {HIDDEN_SIZE_2}) "
             "(stale network.quant from an older architecture?)"
         )
     expected_codes = _header_quant_codes()
@@ -222,6 +250,7 @@ class QuantizedNet:
     """Integer simulation of amy's quantized network (neural_net.c)."""
 
     input_w: np.ndarray  # int8 (N_FEATURES, ACCUMULATOR_SIZE), scale 64
+    pawn_w: np.ndarray  # int8 (N_PAWN_FEATURES, ACCUMULATOR_SIZE), scale 64
     input_b: np.ndarray  # int16 (ACCUMULATOR_SIZE,), scale 64
     h1_w: np.ndarray  # int16 (HIDDEN_SIZE_1, 2*ACC), scale 8192
     h1_b: np.ndarray  # int32 (HIDDEN_SIZE_1,), scale 64*8192
@@ -239,6 +268,7 @@ class QuantizedNet:
 
         return QuantizedNet(
             input_w=shaped("input_layer_weights_q"),
+            pawn_w=shaped("input_pawn_weights_q"),
             input_b=shaped("input_layer_bias_q"),
             h1_w=shaped("hidden_layer_1_weights_q"),
             h1_b=shaped("hidden_layer_1_bias_q"),
@@ -254,13 +284,17 @@ class QuantizedNet:
 
     # -- integer pipeline, matching neural_net.c step by step ----------
 
-    def accumulator(self, feat: np.ndarray) -> np.ndarray:
+    def accumulator(
+        self, feat: np.ndarray, pfeat: np.ndarray | None = None
+    ) -> np.ndarray:
         """(B, K) int32 indices (padded -1) -> raw int16 accumulator (B, ACCUMULATOR_SIZE).
 
         Like amy: the accumulator is maintained in int16 with wrap-around
         in units of 1/SCALE_INPUT, starting from the int16 input bias
-        (same scale).  The clamping to [0, SCALE_INPUT] happens only at
-        evaluation time (see evaluate()).
+        (same scale), plus the piece feature rows and, if given, the
+        pawn pair rows (padded -1 the same way).  The clamping to
+        [0, SCALE_INPUT] happens only at evaluation time (see
+        evaluate()).
         """
         acc = np.zeros((feat.shape[0], ACCUMULATOR_SIZE), dtype=np.int32)
         acc += self.input_b.astype(np.int32)
@@ -274,10 +308,26 @@ class QuantizedNet:
                 .astype(np.int16)
                 .astype(np.int32)
             )
+        if pfeat is not None:
+            for k in range(pfeat.shape[1]):
+                idx = pfeat[:, k]
+                valid = idx >= 0
+                if not np.any(valid):
+                    continue
+                acc[valid] = (
+                    (acc[valid] + self.pawn_w[idx[valid]].astype(np.int32))
+                    .astype(np.int16)
+                    .astype(np.int32)
+                )
         return acc
 
     def evaluate(
-        self, feat_w: np.ndarray, feat_b: np.ndarray, turn: np.ndarray
+        self,
+        feat_w: np.ndarray,
+        feat_b: np.ndarray,
+        pfeat_w: np.ndarray | None,
+        pfeat_b: np.ndarray | None,
+        turn: np.ndarray,
     ) -> np.ndarray:
         """Scores in millipawns, side to move. turn: (B,) 0/1.
 
@@ -285,8 +335,8 @@ class QuantizedNet:
         with W in [new][old] file layout; in matrix form that is
         (W @ z.T).T.
         """
-        acc_w = self.accumulator(feat_w)
-        acc_b = self.accumulator(feat_b)
+        acc_w = self.accumulator(feat_w, pfeat_w)
+        acc_b = self.accumulator(feat_b, pfeat_b)
         n = feat_w.shape[0]
         acc = np.empty((n, 2 * ACCUMULATOR_SIZE), dtype=np.int32)
         wm = turn == 0

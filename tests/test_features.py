@@ -19,13 +19,18 @@ from amy_training_nnue.features import (
     FLIP,
     MIRROR,
     N_FEATURES,
+    N_PAWN_FEATURES,
     PLANE_SIZE,
     canonical_frame,
     feature_indices,
+    pawn_feature_indices,
+    pawn_pair_index,
 )
 from amy_training_nnue.position import mirror_board
 
 INIT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"
+# After 1.e4 e5 2.Nf3: pawns on files a-d, f-h plus e4/e5 (same file).
+E4E5 = "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -"
 
 
 def _board_from_epd(epd: str) -> np.ndarray:
@@ -248,3 +253,149 @@ def test_en_passant_square_is_empty_for_features():
     assert PLANE_SIZE * 5 + 64 * w_king + (ep ^ w_flip) not in w  # opponent pawn
     assert PLANE_SIZE * 0 + 64 * b_king + (ep ^ b_flip) not in b
     assert PLANE_SIZE * 5 + 64 * b_king + (ep ^ b_flip) not in b
+
+
+# ---------------------------------------------------------------------------
+# Pawn pair features
+# ---------------------------------------------------------------------------
+
+
+def test_n_pawn_features():
+    # 96 color-square ids (2 colors x 48 pawn squares, ranks 2..7), one
+    # feature per unordered pair.
+    assert N_PAWN_FEATURES == 96 * 95 // 2 == 4560
+
+
+def test_pawn_pair_index():
+    # Worked example from CHANGES-pawn-features.md: starting position,
+    # (b2, a2) in the white frame -> ids 6 and 7 -> index 27; in the
+    # black frame -> ids 94 and 95 -> index 4559 (the maximum).
+    assert pawn_pair_index(6, 7) == 27
+    assert pawn_pair_index(94, 95) == 4559
+    assert pawn_pair_index(0, 1) == 0
+    for a in range(0, 96, 7):
+        for b in range(a + 1, 96, 5):
+            assert pawn_pair_index(a, b) == pawn_pair_index(b, a)
+
+
+def test_pawn_pair_index_bijective_and_active_rows():
+    """The combadic index is bijective over all 4560 unordered pairs of
+    the 96 color-square ids, and exactly 1488 of those pairs are active:
+    the two squares within one file of distance, excluding the 48
+    opposite-color same-square pairs (impossible on a real board)."""
+    seen = {}
+    active = 0
+    for a in range(96):
+        fa = (a % 48 + 8) & 7
+        for b in range(a + 1, 96):
+            fb = (b % 48 + 8) & 7
+            idx = pawn_pair_index(a, b)
+            assert idx not in seen
+            seen[idx] = (a, b)
+            same_square_opp_color = a % 48 == b % 48
+            if abs(fa - fb) <= 1 and not same_square_opp_color:
+                active += 1
+    assert len(seen) == N_PAWN_FEATURES
+    assert max(seen) == N_PAWN_FEATURES - 1
+    assert active == 1488
+
+
+def test_initial_position_pawn_pairs():
+    board = _board_from_epd(INIT)
+    w, b = pawn_feature_indices(board)
+    # 16 pawns, 2 per file: 8 same-file pairs + 7 adjacent-file pairs
+    # x 4 color combinations = 36 pairs, for both sides.
+    assert len(w) == 36
+    assert len(b) == 36
+    # Worked example from CHANGES-pawn-features.md (king e1 -> w frame,
+    # king e8 -> b frame): the (b2, a2) pair is index 27 in the white
+    # frame (own pawns, ids 6/7) and, with the colors swapped to 48+
+    # 54-8 = 94 and 48 + 55-8 = 95, index 4559 (the maximum) in the
+    # black frame.  Symmetrically, the (a7, b7) pair is 27 in the black
+    # frame and 4559 in the white frame, so both indices occur on both
+    # sides.
+    assert 27 in w.tolist()  # white a2/b2, white frame
+    assert 4559 in w.tolist()  # black a7/b7, white frame
+    assert 27 in b.tolist()  # black a7/b7, black frame
+    assert 4559 in b.tolist()  # white a2/b2, black frame
+    # All indices in range, each pair counted once.
+    assert min(w) >= 0 and max(w) < N_PAWN_FEATURES
+    assert min(b) >= 0 and max(b) < N_PAWN_FEATURES
+    assert len(set(w.tolist())) == len(w)
+    assert len(set(b.tolist())) == len(b)
+
+
+def test_pawn_pairs_after_e4e5():
+    """Hand-computed e4-e5 index for 1.e4 e5 2.Nf3.
+
+    e4 is square 28, e5 square 36.  White king e1 -> w_flip = 7: e4
+    (28^7 = 27 -> id 19, own pawn) and e5 (36^7 = 35 -> id 48+27 = 75,
+    opponent pawn) -> pair index 75*74/2 + 19 = 2794.  Black king e8 ->
+    b_flip = 0x3f: e4 (28^0x3f = 35 -> id 48+27 = 75, opponent in the
+    black frame) and e5 (36^0x3f = 27 -> id 19, own pawn) -> the same
+    pair (19, 75) -> 2794.  Both accumulators see the e4-e5 pair under
+    the same index.
+    """
+    board = _board_from_epd(E4E5)
+    w, b = pawn_feature_indices(board)
+    assert len(w) == 36
+    assert len(b) == 36
+    assert 2794 in w.tolist()
+    assert 2794 in b.tolist()
+
+
+def test_pawn_pairs_file_distance_filter():
+    # Adjacent files -> one pair; one file apart -> none; same file ->
+    # one pair.
+    adjacent = _board_from_epd("4k3/8/8/8/8/8/PP6/K7 w - -")
+    w, b = pawn_feature_indices(adjacent)
+    assert len(w) == 1
+    assert len(b) == 1
+    two_files_apart = _board_from_epd("4k3/8/8/8/8/8/P1P5/K7 w - -")
+    w, b = pawn_feature_indices(two_files_apart)
+    assert w.tolist() == []
+    assert b.tolist() == []
+    same_file = _board_from_epd("4k3/8/8/8/8/2P5/2P41/K7 w - -")
+    w, b = pawn_feature_indices(same_file)
+    assert len(w) == 1
+    assert len(b) == 1
+
+
+def test_bare_kings_no_pawn_pairs():
+    board = _board_from_epd("4k3/8/8/8/8/8/8/4K3 w - -")
+    w, b = pawn_feature_indices(board)
+    assert w.tolist() == []
+    assert b.tolist() == []
+
+
+def test_mirrored_board_has_identical_pawn_pairs():
+    """Like the piece features: the horizontal mirror image of a
+    position produces identical pawn pair index sets for both sides."""
+    for epd in (INIT, E4E5, "3r1k2/p3qppp/8/3p4/3r4/5QP1/P4PB1/4R1K1 w - -"):
+        board = _board_from_epd(epd)
+        w1, b1 = pawn_feature_indices(board)
+        w2, b2 = pawn_feature_indices(mirror_board(board))
+        assert set(w1.tolist()) == set(w2.tolist()), epd
+        assert set(b1.tolist()) == set(b2.tolist()), epd
+
+
+def test_pawn_pairs_flip_symmetry():
+    """Like the piece features: the vertically flipped position with
+    swapped colors must give flipped_white_pairs == original_black_pairs
+    and flipped_black_pairs == original_white_pairs."""
+    for epd in (INIT, E4E5):
+        board = _board_from_epd(epd)
+        w, b = pawn_feature_indices(board)
+        flipped = np.zeros(64, dtype=np.int8)
+        for sq in range(64):
+            flipped[sq] = -board[sq ^ FLIP]
+        wf, bf = pawn_feature_indices(flipped)
+        assert set(wf.tolist()) == set(b.tolist())
+        assert set(bf.tolist()) == set(w.tolist())
+
+
+def test_pawn_pairs_missing_king_rejected():
+    board = np.zeros(64, dtype=np.int8)
+    board[0] = 1
+    with pytest.raises(ValueError):
+        pawn_feature_indices(board)

@@ -88,7 +88,11 @@ def model_predictions(
     for i in range(0, len(idx), batch_size):
         sel = idx[i : i + batch_size]
         out = model(
-            mx.array(ds.feat_w[sel]), mx.array(ds.feat_b[sel]), mx.array(ds.turn[sel])
+            mx.array(ds.feat_w[sel]),
+            mx.array(ds.feat_b[sel]),
+            mx.array(ds.pfeat_w[sel]),
+            mx.array(ds.pfeat_b[sel]),
+            mx.array(ds.turn[sel]),
         )
         preds.append(np.array(out))
     return np.concatenate(preds)
@@ -111,7 +115,15 @@ def _quant_metrics(
     preds = []
     for i in range(0, len(idx), batch_size):
         sel = idx[i : i + batch_size]
-        preds.append(qnet.evaluate(ds.feat_w[sel], ds.feat_b[sel], ds.turn[sel]))
+        preds.append(
+            qnet.evaluate(
+                ds.feat_w[sel],
+                ds.feat_b[sel],
+                ds.pfeat_w[sel],
+                ds.pfeat_b[sel],
+                ds.turn[sel],
+            )
+        )
     pred_mp = np.concatenate(preds).astype(np.float64)
     target_mp = ds.score[idx].astype(np.float64)
     diff = pred_mp - target_mp
@@ -139,14 +151,14 @@ def weight_max_abs(model: NnueNet) -> dict:
     }
 
 
-def _loss(model, fw, fb, turn, target):
+def _loss(model, fw, fb, pfw, pfb, turn, target):
     """MSE in tanh-squeezed space: targets are score/10000, but the loss
     trains tanh(out) against tanh(target), squeezing large score swings
     into (-1, 1).  For playing strength, capturing about-even positions
     (eval near 0) accurately matters more than predicting large
     positive/negative scores exactly (literature confirms), and tanh
     biases the network toward that regime."""
-    out = mx.tanh(model(fw, fb, turn))
+    out = mx.tanh(model(fw, fb, pfw, pfb, turn))
     target = mx.tanh(target)
     return mx.mean((out - target) ** 2)
 
@@ -180,8 +192,8 @@ def train(config: TrainConfig) -> Path:
 
     bound = config.weight_bound
 
-    def step(fw, fb, turn, target):
-        loss, grads = loss_and_grad_fn(model, fw, fb, turn, target)
+    def step(fw, fb, pfw, pfb, turn, target):
+        loss, grads = loss_and_grad_fn(model, fw, fb, pfw, pfb, turn, target)
         opt.update(model, grads)
 
         if bound is not None:
@@ -200,9 +212,11 @@ def train(config: TrainConfig) -> Path:
             sel = order[i : i + config.batch_size]
             fw = mx.array(ds.feat_w[sel])
             fb = mx.array(ds.feat_b[sel])
+            pfw = mx.array(ds.pfeat_w[sel])
+            pfb = mx.array(ds.pfeat_b[sel])
             turn = mx.array(ds.turn[sel])
             target = mx.array(ds.target[sel])
-            loss = step(fw, fb, turn, target)
+            loss = step(fw, fb, pfw, pfb, turn, target)
             loss_val = float(loss.item())
             epoch_loss += loss_val
             n_batches += 1
@@ -215,8 +229,9 @@ def train(config: TrainConfig) -> Path:
                     f"epoch {epoch + 1}/{config.epochs} "
                     f"step {n_batches}/{total_batches} "
                     f"loss {loss_val:.6f} "
-                    f"max|w| in={wm['input_w']:.3f} h1={wm['h1_w']:.3f} "
-                    f"h2={wm['h2_w']:.3f} out={wm['out_w']:.3f}",
+                    f"max|w| in={wm['input_w']:.3f} pawn={wm['pawn_w']:.3f} "
+                    f"h1={wm['h1_w']:.3f} h2={wm['h2_w']:.3f} "
+                    f"out={wm['out_w']:.3f}",
                     flush=True,
                 )
         dt = time.time() - t0

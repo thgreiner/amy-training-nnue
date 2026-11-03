@@ -25,6 +25,26 @@ pieces are not restricted to the left half, only the king) and
 (a1 = 0 ... d1 = 3, a2 = 4 ... d2 = 7, ..., a8 = 28 ... d8 = 31), as
 in ``index_half_mirrored()`` of neural_net.c.
 
+On top of the piece features there are pawn *pair* features (see
+nn_init_pawns() of neural_net.c): every unordered pair of pawns on the
+board within one file of distance (same file, any rank, or adjacent
+files) is a feature.  Color combinations matter (own/own, opponent/
+opponent, own/opponent); a pair is counted once.  Within one canonical
+frame each pawn maps to a color-square id in 0..95
+(``color * 48 + (sq_frame - 8)``, ranks 2..7 only; in the white frame
+white pawns have color 0, in the black frame the colors are swapped,
+so in either frame own pawns are 0..47 and opponent pawns 48..95), and
+the unordered pair (i1, i2) maps to the combadic index
+``hi * (hi - 1) / 2 + lo`` with hi = max, lo = min, in 0..4559:
+
+    N_PAWN_FEATURES = 96 * 95 / 2 = 4560
+
+Only the 1488 pairs whose two squares are within one file are ever
+active; the remaining rows of the shared N_PAWN_FEATURES x
+ACCUMULATOR_SIZE int8 pawn weight matrix are dead (zero in the file).
+Each side's accumulator sums the rows of all active pairs, computed in
+that side's canonical frame; both sides read the same matrix.
+
 Each side has its own ACCUMULATOR_SIZE-dim accumulator (int16 in amy)
 initialized with the input bias plus the sum of the weights of the
 active features; the side-to-move accumulator is the first half and the
@@ -42,6 +62,11 @@ N_PIECE_TYPES = 10
 # One plane per piece type (0..4 own pawn..queen, 5..9 opponent
 # pawn..queen); the kings are not features, they define the frame.
 N_FEATURES = 10 * 32 * 64  # 20480
+# Pawn pair features: 2 colors x 48 pawn squares (ranks 2..7) = 96
+# color-square ids, one feature per unordered pair (combadic index).
+N_PAWN_SQUARES = 48  # ranks 2..7 of one frame
+N_PAWN_IDS = 2 * N_PAWN_SQUARES  # 96
+N_PAWN_FEATURES = N_PAWN_IDS * (N_PAWN_IDS - 1) // 2  # 4560
 ACCUMULATOR_SIZE = 256
 HIDDEN_SIZE_1 = 32
 HIDDEN_SIZE_2 = 32
@@ -71,6 +96,64 @@ def canonical_frame(side: int, king_sq: int) -> tuple[int, int]:
         k ^= MIRROR
         flip |= MIRROR
     return flip, (k & 3) | ((k & 0x38) >> 1)
+
+
+def pawn_pair_index(i1: int, i2: int) -> int:
+    """Combadic index of an unordered pair of color-square ids 0..95,
+    matching nn_pp_index() of neural_net.c: hi * (hi - 1) / 2 + lo with
+    hi = max(i1, i2), lo = min(i1, i2).  Result in 0..N_PAWN_FEATURES-1.
+    """
+    hi, lo = max(i1, i2), min(i1, i2)
+    return hi * (hi - 1) // 2 + lo
+
+
+def pawn_feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (white_pawn_pair_indices, black_pawn_pair_indices).
+
+    Bit-exact twin of nn_init_pawns() of neural_net.c: every unordered
+    pair of pawns (any color combination) within one file of distance
+    contributes one combadic index (see pawn_pair_index) computed in
+    the side's canonical frame (the same frame as the piece features).
+    Both sides get the same pairs, mapped through their own frame.
+
+    ``board`` is a 64-element int8 array as in BpdRecord.board();
+    pawns must be on ranks 2..7 (ranks 1/8 would index out of bounds,
+    as in the engine).
+    """
+    if (board == 6).sum() != 1 or (board == -6).sum() != 1:
+        raise ValueError("board must contain exactly one king per side")
+    white_king = int(np.argmax(board == 6))
+    black_king = int(np.argmax(board == -6))
+    w_flip, _ = canonical_frame(WHITE, white_king)
+    b_flip, _ = canonical_frame(BLACK, black_king)
+
+    # Pawn squares ascending, with c = 0 for white pawns and 1 for
+    # black pawns (white-frame colors; the black frame swaps them).
+    sqs = np.flatnonzero(np.abs(board) == 1)
+    colors = (board[sqs] < 0).astype(np.int64)
+    n = len(sqs)
+    if n < 2:
+        empty = np.empty(0, dtype=np.int32)
+        return empty, empty
+
+    i1, i2 = np.triu_indices(n, 1)
+    sel = np.abs((sqs[i1] & 7) - (sqs[i2] & 7)) <= 1
+    i1, i2 = i1[sel], i2[sel]
+
+    def pairs(flip: int, swapped: bool) -> np.ndarray:
+        # swapped=True (black frame): own pawns are black pawns, so the
+        # color id is negated (1 - c).
+        c1 = (1 - colors[i1]) if swapped else colors[i1]
+        c2 = (1 - colors[i2]) if swapped else colors[i2]
+        a = c1 * N_PAWN_SQUARES + (sqs[i1] ^ flip) - 8
+        b = c2 * N_PAWN_SQUARES + (sqs[i2] ^ flip) - 8
+        hi = np.maximum(a, b)
+        lo = np.minimum(a, b)
+        return (hi * (hi - 1) // 2 + lo).astype(np.int32)
+
+    white = pairs(w_flip, False)
+    black = pairs(b_flip, True)
+    return white, black
 
 
 def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

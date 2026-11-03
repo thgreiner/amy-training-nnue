@@ -117,6 +117,13 @@ class BpdRecord:
             problems.append("expected exactly one white king")
         if (board == -6).sum() != 1:
             problems.append("expected exactly one black king")
+        # Pawns only exist on ranks 2..7 (0-based ranks 1..6); on rank
+        # 1 or 8 the pawn pair feature index (sq_frame - 8) would run
+        # out of bounds, as in the engine.
+        pawn_sqs = np.flatnonzero(np.abs(board) == 1)
+        pawn_ranks = pawn_sqs >> 3
+        for sq in pawn_sqs[(pawn_ranks < 1) | (pawn_ranks > 6)]:
+            problems.append(f"pawn on {square_name(sq)} off-rank")
         # The en passant square, if present, must be on rank 3 or 6
         # (ranks 2 or 5, 0-based) and must be empty.
         for word_idx, word in enumerate(self.pos):

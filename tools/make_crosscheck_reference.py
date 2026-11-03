@@ -24,6 +24,7 @@ from amy_training_nnue.features import (  # noqa: E402
     HIDDEN_SIZE_1,
     HIDDEN_SIZE_2,
     N_FEATURES,
+    N_PAWN_FEATURES,
 )
 from amy_training_nnue.quantize import (  # noqa: E402
     quantize_parameters,
@@ -51,12 +52,13 @@ EPS = [
 
 SEED = 1234
 
-# input_w is drawn from [-1, 1]: the range representable by int8 at
-# scale 64 (and the range trained weights are kept in).
+# input_w and pawn_w are drawn from [-1, 1]: the range representable by
+# int8 at scale 64 (and the range trained weights are kept in).
 rng = np.random.default_rng(SEED)
 params = {
     "input_w": rng.uniform(-1, 1, (N_FEATURES, ACCUMULATOR_SIZE)),
     "input_b": rng.uniform(-1, 1, (ACCUMULATOR_SIZE,)),
+    "pawn_w": rng.uniform(-1, 1, (N_PAWN_FEATURES, ACCUMULATOR_SIZE)),
     "h1_w": rng.uniform(-2, 2, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
     "h1_b": rng.uniform(-2, 2, (HIDDEN_SIZE_1,)),
     "h2_w": rng.uniform(-2, 2, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),

@@ -18,13 +18,15 @@ import numpy as np
 import pytest
 
 from amy_training_nnue.bpd import BLACK, WHITE
-from amy_training_nnue.dataset import MAX_FEATURES
+from amy_training_nnue.dataset import MAX_FEATURES, MAX_PAWN_FEATURES
 from amy_training_nnue.features import (
     ACCUMULATOR_SIZE,
     HIDDEN_SIZE_1,
     HIDDEN_SIZE_2,
     N_FEATURES,
+    N_PAWN_FEATURES,
     feature_indices,
+    pawn_feature_indices,
 )
 from amy_training_nnue.quantize import QuantizedNet, quantize_parameters
 
@@ -35,13 +37,14 @@ def _make_network(seed: int) -> QuantizedNet:
     """Regenerate the deterministic random network from the reference.
 
     Must mirror tools/make_crosscheck_reference.py exactly (same seed,
-    same draw order; input_w is drawn from [-1, 1], the range
-    representable by int8 at scale 64).
+    same draw order; input_w and pawn_w are drawn from [-1, 1], the
+    range representable by int8 at scale 64).
     """
     rng = np.random.default_rng(seed)
     params = {
         "input_w": rng.uniform(-1, 1, (N_FEATURES, ACCUMULATOR_SIZE)),
         "input_b": rng.uniform(-1, 1, (ACCUMULATOR_SIZE,)),
+        "pawn_w": rng.uniform(-1, 1, (N_PAWN_FEATURES, ACCUMULATOR_SIZE)),
         "h1_w": rng.uniform(-2, 2, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
         "h1_b": rng.uniform(-2, 2, (HIDDEN_SIZE_1,)),
         "h2_w": rng.uniform(-2, 2, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
@@ -88,19 +91,27 @@ def _pad(feat: np.ndarray) -> np.ndarray:
     return out
 
 
+def _pad_pawn(feat: np.ndarray) -> np.ndarray:
+    out = np.full((1, MAX_PAWN_FEATURES), -1, dtype=np.int32)
+    out[0, : len(feat)] = feat
+    return out
+
+
 @pytest.fixture(scope="module")
 def reference():
     return json.loads(DATA.read_text())
 
 
 def test_accumulators_match_c(reference):
-    """Raw (int16 wrap-around) accumulators must equal amy's."""
+    """Raw (int16 wrap-around) accumulators must equal amy's, including
+    the pawn pair rows."""
     ref = reference["positions"][0]
     qnet = _make_network(reference["seed"])
     board = _board_from_epd(ref["epd"])
     fw, fb = feature_indices(board)
-    acc_w = qnet.accumulator(_pad(fw))[0]
-    acc_b = qnet.accumulator(_pad(fb))[0]
+    pfw, pfb = pawn_feature_indices(board)
+    acc_w = qnet.accumulator(_pad(fw), _pad_pawn(pfw))[0]
+    acc_b = qnet.accumulator(_pad(fb), _pad_pawn(pfb))[0]
     assert np.array_equal(acc_w, np.asarray(ref["acc_w"], dtype=np.int32))
     assert np.array_equal(acc_b, np.asarray(ref["acc_b"], dtype=np.int32))
 
@@ -113,7 +124,14 @@ def test_scores_match_c(reference):
         turn = WHITE if " w " in ref["epd"] else BLACK
         assert turn == ref["turn"]
         fw, fb = feature_indices(board)
+        pfw, pfb = pawn_feature_indices(board)
         score = int(
-            qnet.evaluate(_pad(fw), _pad(fb), np.array([turn], dtype=np.uint8))[0]
+            qnet.evaluate(
+                _pad(fw),
+                _pad(fb),
+                _pad_pawn(pfw),
+                _pad_pawn(pfb),
+                np.array([turn], dtype=np.uint8),
+            )[0]
         )
         assert score == ref["score"], f"{ref['epd']}: {score} != {ref['score']}"
