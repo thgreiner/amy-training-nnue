@@ -1,7 +1,7 @@
 # Plan: attack-map features + C feature generation for training
 
-Status: **in progress** — T0, T2 and T3a done (see Progress log); T1,
-T3b, T4, T5 open.
+Status: **in progress** — T0, T2, T3 (incl. T3b), T4 and T5 done (see
+Progress log); T1 open.
 Target branch: `feature/neural-network-with-pawns` (repo `amy-eval-nnue`; the
 original `feature/king-half-mirrored` target was superseded).
 Date: 2026-02-25
@@ -65,9 +65,9 @@ Note: after T1 this document moves to the amy repo root (PLAN-*.md convention).
   rows to the accumulator (int16 wrap-around, same pattern as the pawn
   block); maps are reset on king moves and position init (committed
   2026-11-06, `8c98046` "Add attack features to the NNUE input").
-  The block is not loaded from `network.quant` yet (T5), so in
-  production it is all-zero and the contribution is a no-op — old
-  network files remain loadable with unchanged behaviour.
+  The block is loaded from `network.quant` (T5 done 2026-11-06,
+  see T4/T5 below); old-format files (no attack block) are
+  rejected by a header assert.
 
 ## Tasks
 
@@ -186,46 +186,87 @@ why only these broke).  Fixed with a one-time `init_all()` guard in
 data extracted before the fix lacks sliding-piece attack rows and
 must be re-extracted.
 
-### T4 — Training pipeline for attack features
+### T4 — Training pipeline for attack features  **DONE (2026-11-06)**
 
-- [ ] `model.py`: second sparse input block per side (attack indices →
-      attack weight matrix), per D6.
-- [ ] `quantize.py`: `QuantizedNet` sums attack rows into the accumulator
+- [x] `model.py`: second sparse input block per side (attack indices →
+      attack weight matrix), per D6.  **Done:** one *shared* float
+      `attack_w` matrix (98,304 × 256) added to `NnueNet` (WEIGHT_NAMES,
+      parameters, EXPECTED_SHAPES, metadata); `accumulator`/`__call__`
+      take `afeat_w`/`afeat_b` and sum the per-side rows — symmetric to
+      the pawn block (each side's active rows feed that side's
+      accumulator; no double-counting).
+- [x] `quantize.py`: `QuantizedNet` sums attack rows into the accumulator
       (same wrap-around int16 semantics as the pawn block); new
       `N_ATTACK_FEATURES` constant; `weights_header()` + export write the
-      new block and header fields.
-- [ ] `.quant` header: new field(s) for attack-feature count + quant code;
+      new block and header fields.  **Done:** `FIELD_ORDER` gains
+      `input_attack_weights_q` (int8, shared, between the pawn block and
+      the input bias, mirroring the C file layout); `QuantizedNet` gains
+      `attack_w` + `afeat_w`/`afeat_b` arguments.
+- [x] `.quant` header: new field(s) for attack-feature count + quant code;
       C `WeightsHeader` struct and `struct.pack` format change in the
       **same commit** as the C loader (T5) — one repo now, so one commit.
-- [ ] Training smoke test on `tests/data/selfplay_sample.bin` (targets and
-      squeezed-space metrics unchanged).
+      **Done (paired with T5):** new `wh_attack_features_size` field,
+      **u32** (98,304 doesn't fit in a u16) — the C struct's natural
+      alignment inserts 2 bytes of padding before it, header grows
+      24 → 28 bytes, Python packs `<IHHH2xIHH8B`.  No quant code: the
+      attack block is int8 at the input scale, like the pawn block
+      (codes stay `1 2 2 3 2 3 3 3`).  File size: 28 + 6,970,244 +
+      25,165,824 = 32,136,096 bytes.
+- [x] Training smoke test on `tests/data/selfplay_sample.bin` (targets and
+      squeezed-space metrics unchanged).  **Done:** `test_train_smoke_on_sample`
+      runs 1 epoch over the C-extracted sample incl. attack features
+      (`train.py`'s loss/steps/eval/logging now thread the attack blocks
+      through).
 
-Gate: full pytest; exported `network.quant` loads in the new C build;
-**training/experiment-only** — do not deploy to the engine until T5 lands.
+Gate (met 2026-11-06): full pytest 68/68; exported `network.quant` loads
+in the new C build (plain `Amy` prints "Read weights."; `nn_crosscheck`
+consumes it); the regenerated cross-check reference's scores shift vs the
+pre-T4 reference — the attack contribution is non-zero.  Old-format files
+are rejected by the C loader (header assert), so a stale `.quant` can no
+longer be silently misread.
 
-### T5 — C engine: load attack block (paired with T4)
+### T5 — C engine: load attack block (paired with T4)  **DONE (2026-11-06)**
 
-- [ ] C `WeightsHeader` + loader read the attack block (size assert +
-      fread), matching the Python export byte-for-byte.
+- [x] C `WeightsHeader` + loader read the attack block (size assert +
+      fread), matching the Python export byte-for-byte.  **Done:**
+      `wh_attack_features_size` (u32) in the struct; loader asserts it
+      and `fread`s `input_attack_weights_q` (int8, 98,304 × 256) right
+      after the pawn block — byte-for-byte paired with the Python export
+      (positive gate: new-format file loads, "Read weights."; negative
+      gate: old-format file aborts on
+      `header.wh_attack_features_size == N_ATTACK_FEATURES` in both
+      `Amy` and `nn_crosscheck`).
 - Note: the original second bullet ("matrix is loaded but **not yet
       used** in evaluation") is obsolete — evaluation **already
-      consumes** the block (`nn_update_attack_maps`).  Until a `.quant`
-      carrying the block is loaded the matrix is all-zero and the
-      contribution is a no-op.
+      consumes** the block (`nn_update_attack_maps`).  Before T5 the
+      matrix was all-zero (no-op); now a trained block changes
+      evaluation (the cross-check reference scores shift).
+- **Loader-gate correction (found during T5):** `Amy --test` does **not**
+  load weights — `--test` dispatches to the test suite inside
+  `main_process_options`, which runs *before* `nn_read_weights()` in
+  `main()`.  The test suite always runs on randomly initialized weights.
+  The loader is exercised by `nn_crosscheck` (bit-exact gate) and by
+  plain `Amy` ("Read weights.").
 
-Gate: `Amy --test` green; a network exported by T4 loads without error
-and changes evaluation (non-zero contribution).
+Gate (met 2026-11-06): `Amy --test` green; a network exported by T4 loads
+without error and changes evaluation (non-zero contribution — reference
+scores shift).  **T3b closed by the same work:** the cross-check network
+carries a random attack block (drawn by `make_crosscheck_reference.py`),
+C loads it, and the bit-exact comparison (scores + raw accumulators) now
+includes attack rows on both sides.
 
 ## Follow-ups (separate tasks, not in this plan)
 
 - F1. ~~C engine attack integration: accumulator contribution at position
       init **plus per-move incremental updates** (D5).~~ **Absorbed
       (2026-11-06)**: the incremental update is implemented in the engine
-      (`nn_update_attack_maps`, see Prerequisite state).  An
-      attack-enabled network is deployable to the engine once T5 loads
-      the block.
+      (`nn_update_attack_maps`, see Prerequisite state).  With T5 done,
+      an attack-trained network is deployable to the engine.
 - F2. Refresh `tests/data/selfplay_sample.bin` once a network trained with
       attack features is in self-play use.
+- F3. `nn_extract.c`'s init fix (T3a) means **all pre-fix training data
+      lacks sliding-piece attack rows** — re-extract before any
+      attack-trained run.
 
 ## Cross-cutting notes
 
@@ -234,12 +275,13 @@ and changes evaluation (non-zero contribution).
   that both sides live in one repo/branch).
 - **Reference pinning**: `crosscheck_reference.json` is pinned to the C
   architecture; regenerate whenever C feature logic changes (T0/T2).
-- **Cross-check pinning of the attack block**: `nn_crosscheck` loads the
-  Python-exported `network.quant`, which has no attack block until T4/T5
-  land — the C-side attack matrix is zero there, so the existing
-  bit-exact comparison is unaffected.  T3a extended the dump with the
-  per-position index sets (piece/pawn/attack); the variant with random
-  attack weights lands in T3b once the format pairs up.
+- **Cross-check pinning of the attack block:** resolved with T4/T5 —
+  `make_crosscheck_reference.py` draws a random `attack_w` into the
+  cross-check network, `nn_crosscheck` loads it from the file, and the
+  bit-exact comparison (scores and raw accumulators) includes attack
+  rows on both sides (this closed T3b).  T3a's per-position index-set
+  dump (`FEAT`/`PFEAT`/`AFEAT`) pins the feature *selection*; the
+  reference now pins the full int pipeline incl. attack rows.
 - **Pawn-rank validation**: `BpdRecord.validate` rules are duplicated in C
   (T2) — keep the cross-test, it is the drift guard.
 
@@ -341,4 +383,36 @@ and changes evaluation (non-zero contribution).
     it.  Training data extracted before this fix must be
     re-extracted.
   Gate: `Amy --test` green; 68/68 pytest.
+- 2026-11-06: T4 + T5 done in the paired commit, closing T3b as well.
+  - C (amy-eval-nnue): `WeightsHeader` gains `wh_attack_features_size`
+    (**u32** — 98,304 doesn't fit in a u16; the struct's natural
+    alignment pads 2 bytes before it, header 24 → 28 bytes); the loader
+    asserts the field and `fread`s `input_attack_weights_q` (int8,
+    98,304 × 256) right after the pawn block.  `test_neural_net.c`
+    comment fixed (the block is no longer "not loaded").
+  - Python (this repo, commit below): `model.py` adds the shared float
+    `attack_w` to `NnueNet` (weights, shapes, metadata) and threads
+    `afeat_w`/`afeat_b` through `accumulator`/`__call__`; `quantize.py`
+    adds `input_attack_weights_q` to `FIELD_ORDER`/`QuantizedNet`
+    (same int16 wrap-around accumulation as the pawn block) and the new
+    header (`<IHHH2xIHH8B`, 28 bytes, codes unchanged — the attack
+    block is int8 at the input scale like the pawn block, no code);
+    `train.py`/`cli.py` thread the attack blocks through the training
+    loop, evaluation and `evaluate`.
+  - Reference: `make_crosscheck_reference.py` draws a random `attack_w`
+    into the cross-check network; `nn_crosscheck` loads it from the
+    file; the regenerated `crosscheck_reference.json` carries the attack
+    contribution (all 6 reference scores shift vs pre-T4; index sets
+    unchanged).  Bit-exact C vs `QuantizedNet` now includes attack rows
+    on both sides — this is exactly the "random attack weights" variant
+    that had been parked as T3b.
+  - Gates: `Amy --test` green; 68/68 pytest (incl. the training smoke
+    test on the selfplay sample); positive loader gate (plain `Amy` on a
+    new-format file prints "Read weights."); negative gate (old-format
+    file aborts on the attack-size assert in both `Amy` and
+    `nn_crosscheck`).
+  - Discovered en route: `Amy --test` does **not** load weights — `--test`
+    exits inside `main_process_options`, before `nn_read_weights()` — so
+    the test suite always runs on random weights and was never a loader
+    gate (documented in T5; AGENTS.md corrected).
 

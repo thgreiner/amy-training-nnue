@@ -44,7 +44,9 @@ by the C engine, not by Python:
   hidden layer 1: input bias int16 @ 64, input weights int8 @ 64 (the hot
   loop is a plain `int16 += int8`, no per-feature rescale), plus — for
   each active pawn pair — the shared pawn weight row int8 @ 64 (same
-  `int16 += int8` add, one row for each side's accumulator); h1 weights
+  `int16 += int8` add, one row for each side's accumulator), plus — for
+  each active attack feature — the shared attack weight row int8 @ 64
+  (same add; see the attack features bullet below); h1 weights
   int16 @ 8192 with an int32 @ 64*8192 bias (sum in 64*8192 units), h2
   weights int16 @ 8192 with an int32 @ 8192*64 bias (sum in 8192*64
   units).  The sums are converted to the 64 / 8192 units of the
@@ -90,6 +92,19 @@ by the C engine, not by Python:
   *set*, mapped through their own frame.  Worked example (starting
   position): (b2, a2) is index 27 in the white frame (ids 6/7) and
   index 4559 in the black frame (ids 94/95, colors swapped).
+- Attack features (see `nn_update_attack_maps()` in neural_net.c and
+  `am_compute_attack_maps()` in attack_map.c): own pieces attacking
+  opponent pieces/pawns (kings never attacked; no pawn→pawn; redundant
+  pairs excluded — queen only on the rays a bishop/rook doesn't cover,
+  bishop/queen pawn attacks only where no pawn attacks) form one row of
+  a *shared* N_ATTACK_FEATURES x ACCUMULATOR_SIZE int8 matrix
+  (98,304 x 256), indexed `64 * 64 * plane + from' * 64 + to'` in the
+  side's canonical frame (both `from` and `to` — folds under
+  mirroring), 24 planes = attacker P..Q × victim P..Q minus pawn→pawn
+  (`plane = (attacker-1)*5 + (victim-2)`, attacker/victim = P..Q =
+  1..5).  Up to `INTSET_SORTED_MAX` (32) active rows per side; more is
+  a fatal error in the engine.  Both sides read the same matrix; each
+  side's rows feed that side's accumulator.
 
 Any change to the pipeline must be re-validated:
 
@@ -101,9 +116,11 @@ Any change to the pipeline must be re-validated:
    The reference also freezes the engine's per-position piece/pawn/attack
    index sets (checked in `test_crosscheck.py` against the Python oracle
    and the C extraction library).
-2. For export changes: copy `network.quant` into a scratch dir, run
-   `Amy --test` there (all tests must pass), and compare
-   `nn_crosscheck` scores with `QuantizedNet.evaluate`.
+2. For export changes: export a `network.quant` and load it in the amy
+   checkout — the loader gate is `nn_crosscheck` (bit-exact) or plain
+   `Amy` (must print "Read weights.").  Note: `Amy --test` does *not*
+   load weights (the `--test` flag exits inside option parsing, before
+   `nn_read_weights()`), so it is a build/test-suite gate only.
 
 ## BPD format
 
@@ -153,20 +170,23 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
   has been removed.  `mirror_board` in position.py remains available for
   tests (e.g. the mirror-folding invariant in test_features.py).
 - Keep the `network.quant` export byte-identical to amy's layout: a
-  24-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
+  28-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
   bytes read as "AMYW",
   then accumulator size 256, number of piece input features 22528,
-  number of pawn input features 4560, hidden layer sizes 32/32,
-  per-field quantization codes 1/2/3 = int8/16/32 — input weights 1,
+  number of pawn input features 4560, 2 bytes of alignment padding, the
+  number of attack input features 98304 as a **u32** (it doesn't fit in
+  a u16, hence the padding), hidden layer sizes 32/32, per-field
+  quantization codes 1/2/3 = int8/16/32 — input weights 1,
   input bias 2, h1 weights 2, h1 bias 3, h2 weights 2, h2 bias 3,
-  output weights 3, output bias 3; the pawn weights have *no* code and
-  are read unconditionally as int8.  See `weights_header()`.  The C
-  struct is 22 field bytes + 2 trailing padding — pack with
-  `struct.pack("<IHHHHH8B2x", ...)`, a 22-byte pack silently
-  misaligns the whole file) followed by 6,970,244 bytes of fields in
-  `write_network_quant`'s order (6,970,268 bytes total): piece input
-  weights, the shared 4560 x 256 int8 pawn block, input bias, hidden
-  and output layers.
+  output weights 3, output bias 3; the pawn and attack weights have
+  *no* code and are read unconditionally as int8.  See
+  `weights_header()`.  The C struct's field bytes + alignment padding
+  exactly fill the 28 bytes — pack with
+  `struct.pack("<IHHH2xIHH8B", ...)`; any other layout silently
+  misaligns the whole file) followed by 32,136,068 bytes of fields in
+  `write_network_quant`'s order (32,136,096 bytes total): piece input
+  weights, the shared 4560 x 256 int8 pawn block, the shared 98,304 x
+  256 int8 attack block, input bias, hidden and output layers.
 - Style: `black` + `isort` (configured in `pyproject.toml`).
 - Data lives in `../amy/evaluation_log.bin` (grows with every selfplay
   session — tests must not read it). `tests/data/selfplay_sample.bin` is

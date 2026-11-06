@@ -20,27 +20,41 @@ from tests.test_features import _board_from_epd  # noqa: E402
 # come from the C feature-extraction constants, see cfeatures.py).
 MAX_FEATURES = 32
 MAX_PAWN_FEATURES = 128
+MAX_ATTACK_FEATURES = 32
 
 
 def _feats(board, batch=1):
+    """Oracle piece/pawn indices plus an empty attack block (the
+    synthetic tests below don't exercise attack rows; the cross-check
+    suite covers those against C)."""
     w, b = feature_indices(board)
     pw, pb = pawn_feature_indices(board)
     fw = np.full((batch, MAX_FEATURES), -1, dtype=np.int32)
     fb = np.full((batch, MAX_FEATURES), -1, dtype=np.int32)
     pfw = np.full((batch, MAX_PAWN_FEATURES), -1, dtype=np.int32)
     pfb = np.full((batch, MAX_PAWN_FEATURES), -1, dtype=np.int32)
+    afw = np.full((batch, MAX_ATTACK_FEATURES), -1, dtype=np.int32)
+    afb = np.full((batch, MAX_ATTACK_FEATURES), -1, dtype=np.int32)
     fw[:, : len(w)] = w
     fb[:, : len(b)] = b
     pfw[:, : len(pw)] = pw
     pfb[:, : len(pb)] = pb
-    return fw, fb, pfw, pfb
+    return fw, fb, pfw, pfb, afw, afb
 
 
 def test_forward_shape():
     model = NnueNet(seed=1)
     board = _board_from_epd("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -")
-    fw, fb, pfw, pfb = _feats(board)
-    out = model(mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0]))
+    fw, fb, pfw, pfb, afw, afb = _feats(board)
+    out = model(
+        mx.array(fw),
+        mx.array(fb),
+        mx.array(pfw),
+        mx.array(pfb),
+        mx.array(afw),
+        mx.array(afb),
+        mx.array([0]),
+    )
     assert out.shape == (1,)
     assert np.isfinite(out.item())
 
@@ -49,12 +63,28 @@ def test_deterministic():
     m1 = NnueNet(seed=7)
     m2 = NnueNet(seed=7)
     board = _board_from_epd("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -")
-    fw, fb, pfw, pfb = _feats(board)
+    fw, fb, pfw, pfb, afw, afb = _feats(board)
     o1 = np.array(
-        m1(mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0]))
+        m1(
+            mx.array(fw),
+            mx.array(fb),
+            mx.array(pfw),
+            mx.array(pfb),
+            mx.array(afw),
+            mx.array(afb),
+            mx.array([0]),
+        )
     )
     o2 = np.array(
-        m2(mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0]))
+        m2(
+            mx.array(fw),
+            mx.array(fb),
+            mx.array(pfw),
+            mx.array(pfb),
+            mx.array(afw),
+            mx.array(afb),
+            mx.array([0]),
+        )
     )
     assert o1 == o2
 
@@ -67,16 +97,28 @@ def test_turn_symmetry():
     board = _board_from_epd(
         "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -"
     )
-    fw, fb, pfw, pfb = _feats(board)
+    fw, fb, pfw, pfb, afw, afb = _feats(board)
     flipped = np.zeros(64, dtype=np.int8)
     for sq in range(64):
         flipped[sq] = -board[sq ^ FLIP]
-    fwf, fbf, pfwf, pfbf = _feats(flipped)
+    fwf, fbf, pfwf, pfbf, afwf, afbf = _feats(flipped)
     s_w = model(
-        mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0])
+        mx.array(fw),
+        mx.array(fb),
+        mx.array(pfw),
+        mx.array(pfb),
+        mx.array(afw),
+        mx.array(afb),
+        mx.array([0]),
     ).item()
     s_b = model(
-        mx.array(fwf), mx.array(fbf), mx.array(pfwf), mx.array(pfbf), mx.array([1])
+        mx.array(fwf),
+        mx.array(fbf),
+        mx.array(pfwf),
+        mx.array(pfbf),
+        mx.array(afwf),
+        mx.array(afbf),
+        mx.array([1]),
     ).item()
     assert s_w == pytest.approx(s_b, rel=1e-6, abs=1e-6)
 
@@ -88,13 +130,15 @@ def test_batch_matches_single():
         ("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", 0),
         ("r3k2r/8/8/8/8/8/8/4K3 b - -", 1),
     ]
-    fws, fbs, pfws, pfbs, turns = [], [], [], [], []
+    fws, fbs, pfws, pfbs, afws, afbs, turns = [], [], [], [], [], [], []
     for epd, turn in specs:
-        fw, fb, pfw, pfb = _feats(_board_from_epd(epd))
+        fw, fb, pfw, pfb, afw, afb = _feats(_board_from_epd(epd))
         fws.append(fw)
         fbs.append(fb)
         pfws.append(pfw)
         pfbs.append(pfb)
+        afws.append(afw)
+        afbs.append(afb)
         turns.append(turn)
     batch = np.array(
         model(
@@ -102,16 +146,20 @@ def test_batch_matches_single():
             mx.array(np.concatenate(fbs)),
             mx.array(np.concatenate(pfws)),
             mx.array(np.concatenate(pfbs)),
+            mx.array(np.concatenate(afws)),
+            mx.array(np.concatenate(afbs)),
             mx.array(turns),
         )
     )
     for i, (epd, turn) in enumerate(specs):
-        f1w, f1b, f1pw, f1pb = _feats(_board_from_epd(epd))
+        f1w, f1b, f1pw, f1pb, f1aw, f1ab = _feats(_board_from_epd(epd))
         single = model(
             mx.array(f1w),
             mx.array(f1b),
             mx.array(f1pw),
             mx.array(f1pb),
+            mx.array(f1aw),
+            mx.array(f1ab),
             mx.array([turn]),
         ).item()
         assert batch[i] == pytest.approx(single, rel=1e-6, abs=1e-6)
@@ -137,12 +185,28 @@ def test_save_load(tmp_path):
     model.save(tmp_path)
     loaded = NnueNet.load(tmp_path)
     board = _board_from_epd("4k3/8/8/8/8/8/8/R3K3 w - -")
-    fw, fb, pfw, pfb = _feats(board)
+    fw, fb, pfw, pfb, afw, afb = _feats(board)
     o1 = np.array(
-        model(mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0]))
+        model(
+            mx.array(fw),
+            mx.array(fb),
+            mx.array(pfw),
+            mx.array(pfb),
+            mx.array(afw),
+            mx.array(afb),
+            mx.array([0]),
+        )
     )
     o2 = np.array(
-        loaded(mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0]))
+        loaded(
+            mx.array(fw),
+            mx.array(fb),
+            mx.array(pfw),
+            mx.array(pfb),
+            mx.array(afw),
+            mx.array(afb),
+            mx.array([0]),
+        )
     )
     assert o1 == o2
 

@@ -92,6 +92,8 @@ def model_predictions(
             mx.array(ds.feat_b[sel]),
             mx.array(ds.pfeat_w[sel]),
             mx.array(ds.pfeat_b[sel]),
+            mx.array(ds.afeat_w[sel]),
+            mx.array(ds.afeat_b[sel]),
             mx.array(ds.turn[sel]),
         )
         preds.append(np.array(out))
@@ -121,6 +123,8 @@ def _quant_metrics(
                 ds.feat_b[sel],
                 ds.pfeat_w[sel],
                 ds.pfeat_b[sel],
+                ds.afeat_w[sel],
+                ds.afeat_b[sel],
                 ds.turn[sel],
             )
         )
@@ -151,14 +155,14 @@ def weight_max_abs(model: NnueNet) -> dict:
     }
 
 
-def _loss(model, fw, fb, pfw, pfb, turn, target):
+def _loss(model, fw, fb, pfw, pfb, afw, afb, turn, target):
     """MSE in tanh-squeezed space: targets are score/10000, but the loss
     trains tanh(out) against tanh(target), squeezing large score swings
     into (-1, 1).  For playing strength, capturing about-even positions
     (eval near 0) accurately matters more than predicting large
     positive/negative scores exactly (literature confirms), and tanh
     biases the network toward that regime."""
-    out = mx.tanh(model(fw, fb, pfw, pfb, turn))
+    out = mx.tanh(model(fw, fb, pfw, pfb, afw, afb, turn))
     target = mx.tanh(target)
     return mx.mean((out - target) ** 2)
 
@@ -192,8 +196,8 @@ def train(config: TrainConfig) -> Path:
 
     bound = config.weight_bound
 
-    def step(fw, fb, pfw, pfb, turn, target):
-        loss, grads = loss_and_grad_fn(model, fw, fb, pfw, pfb, turn, target)
+    def step(fw, fb, pfw, pfb, afw, afb, turn, target):
+        loss, grads = loss_and_grad_fn(model, fw, fb, pfw, pfb, afw, afb, turn, target)
         opt.update(model, grads)
 
         if bound is not None:
@@ -214,9 +218,11 @@ def train(config: TrainConfig) -> Path:
             fb = mx.array(ds.feat_b[sel])
             pfw = mx.array(ds.pfeat_w[sel])
             pfb = mx.array(ds.pfeat_b[sel])
+            afw = mx.array(ds.afeat_w[sel])
+            afb = mx.array(ds.afeat_b[sel])
             turn = mx.array(ds.turn[sel])
             target = mx.array(ds.target[sel])
-            loss = step(fw, fb, pfw, pfb, turn, target)
+            loss = step(fw, fb, pfw, pfb, afw, afb, turn, target)
             loss_val = float(loss.item())
             epoch_loss += loss_val
             n_batches += 1
@@ -230,6 +236,7 @@ def train(config: TrainConfig) -> Path:
                     f"step {n_batches}/{total_batches} "
                     f"loss {loss_val:.6f} "
                     f"max|w| in={wm['input_w']:.3f} pawn={wm['pawn_w']:.3f} "
+                    f"attack={wm['attack_w']:.3f} "
                     f"h1={wm['h1_w']:.3f} h2={wm['h2_w']:.3f} "
                     f"out={wm['out_w']:.3f}",
                     flush=True,
