@@ -12,15 +12,18 @@ a canonical frame per side.  Each side's own king defines the frame:
    (independent bit masks), so a position and its horizontal mirror
    image produce the *same* feature vectors for both sides.
 
-There are 10 piece types (0..4 = own pawn..queen, 5..9 = opponent
-pawn..queen; the kings are *not* piece features, they only define the
-frame), 32 canonical own king positions, and 64 piece squares:
+There are 10 piece planes (0..4 = own pawn..queen, 5..9 = opponent
+pawn..queen) plus plane 10, which encodes the *opponent* king in the
+side's own canonical frame; the own king is *not* a feature, it only
+defines the frame.  Together with 32 canonical own king positions and
+64 squares:
 
-    N_FEATURES = 10 * 32 * 64 = 20480
+    N_FEATURES = 11 * 32 * 64 = 22528
     index = 2048 * plane + 64 * king_index + sq'
 
-with ``sq'`` the piece square in the side's canonical frame (0..63;
-pieces are not restricted to the left half, only the king) and
+with ``sq'`` the piece square (for plane 10: the opponent king's
+square) in the side's canonical frame (0..63; pieces are not
+restricted to the left half, only the king) and
 ``king_index = file + 4 * rank`` of the canonical own king
 (a1 = 0 ... d1 = 3, a2 = 4 ... d2 = 7, ..., a8 = 28 ... d8 = 31), as
 in ``index_half_mirrored()`` of neural_net.c.
@@ -60,8 +63,10 @@ from .bpd import BLACK, WHITE
 
 N_PIECE_TYPES = 10
 # One plane per piece type (0..4 own pawn..queen, 5..9 opponent
-# pawn..queen); the kings are not features, they define the frame.
-N_FEATURES = 10 * 32 * 64  # 20480
+# pawn..queen), plus plane 10 = the opponent king in the side's own
+# canonical frame.  The own king is not a feature; it defines the
+# frame.
+N_FEATURES = 11 * 32 * 64  # 22528
 # Pawn pair features: 2 colors x 48 pawn squares (ranks 2..7) = 96
 # color-square ids, one feature per unordered pair (combadic index).
 N_PAWN_SQUARES = 48  # ranks 2..7 of one frame
@@ -160,9 +165,10 @@ def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return (white_accumulator_indices, black_accumulator_indices).
 
     ``board`` is a 64-element int8 array as in BpdRecord.board().
-    Each returned array holds the 20480-space index of every active
-    feature of that side's accumulator (up to 30 entries: 15 own and
-    15 opponent pieces, kings excluded).
+    Each returned array holds the index of every active feature of
+    that side's accumulator (up to 31 entries: 15 own and 15 opponent
+    pieces, plus the opponent king on plane 10; the own king is not a
+    feature, it only defines the frame).
     """
     if (board == 6).sum() != 1 or (board == -6).sum() != 1:
         raise ValueError("board must contain exactly one king per side")
@@ -187,4 +193,10 @@ def feature_indices(board: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             if t < QUEEN:
                 black.append(PLANE_SIZE * t + 64 * b_king + (sq ^ b_flip))
                 white.append(PLANE_SIZE * (t + 5) + 64 * w_king + (sq ^ w_flip))
+    # Plane 10: the opponent king, in the side's own canonical frame
+    # (nn_build_accumulator() of neural_net.c).  The square being
+    # transformed is the opponent's; the frame (flip, king_index)
+    # belongs to the side being evaluated.
+    white.append(PLANE_SIZE * 10 + 64 * w_king + (black_king ^ w_flip))
+    black.append(PLANE_SIZE * 10 + 64 * b_king + (white_king ^ b_flip))
     return (np.asarray(white, dtype=np.int32), np.asarray(black, dtype=np.int32))

@@ -2,13 +2,16 @@
 
 Index formula (amy neural_net.c, king-half canonical frame):
     index = 2048 * plane + 64 * king_index + sq'
-with plane 0..4 = own pawn..queen and plane 5..9 = opponent pawn..queen
-(the kings are not features; they only define the frame); ``king_index``
+with plane 0..4 = own pawn..queen, plane 5..9 = opponent pawn..queen,
+and plane 10 = the opponent king in the side's own canonical frame
+(the own king is not a feature; it only defines the frame);
+``king_index``
 is the side's king in the canonical (left-half) frame, a1 = 0 ... d1 =
 3, ..., a8 = 28 ... d8 = 31, and ``sq'`` is the piece square in that
-frame: black's squares are rank-flipped (``sq ^ 0x38``) and, whenever
-the own king stands on files e..h, the whole frame is mirrored
-horizontally (``sq ^ 0x07``).
+frame (for plane 10, the opponent king's square): black's squares are
+rank-flipped (``sq ^ 0x38``) and, whenever the own king stands on
+files e..h, the whole frame is mirrored horizontally
+(``sq ^ 0x07``).
 """
 
 import numpy as np
@@ -64,9 +67,9 @@ def _board_from_epd(epd: str) -> np.ndarray:
 
 
 def test_n_features():
-    assert N_FEATURES == 10 * 32 * 64 == 20480
-    # Max index: plane 9 (opponent queen), king_index 31 (d8), square 63.
-    assert PLANE_SIZE * 9 + 64 * 31 + 63 == N_FEATURES - 1
+    assert N_FEATURES == 11 * 32 * 64 == 22528
+    # Max index: plane 10 (opponent king), king_index 31 (d8), square 63.
+    assert PLANE_SIZE * 10 + 64 * 31 + 63 == N_FEATURES - 1
 
 
 def test_flip_masks_commute():
@@ -115,10 +118,11 @@ def test_king_index_collapses_mirror_pairs():
 def test_initial_position_white_features():
     board = _board_from_epd(INIT)
     w, b = feature_indices(board)
-    # 15 own + 15 opponent non-king pieces per accumulator; the kings
-    # themselves are not features (they define the frame).
-    assert len(w) == 30
-    assert len(b) == 30
+    # 15 own + 15 opponent non-king pieces plus the opponent king
+    # (plane 10) per accumulator; the own king itself is not a feature
+    # (it defines the frame).
+    assert len(w) == 31
+    assert len(b) == 31
     # White frame: king e1 (sq 4) -> mirrored to d1 -> king_index 3,
     # every square file-flipped (sq ^ 0x07).
     # White pawns a2..h2 (sq 8..15 -> 15..8): plane 0 -> 64*3 + 8..15.
@@ -131,8 +135,16 @@ def test_initial_position_white_features():
     # Black pawns a7..h7 (sq 48..55 -> 55..48) are opponents (plane 5):
     assert 5 * PLANE_SIZE + 192 + 48 in w
     assert 5 * PLANE_SIZE + 192 + 55 in w
-    # Black king e8 is *not* a feature (kings only define the frame).
+    # Black king e8 is *not* a piece feature (kings only define the
+    # frame) ... except on plane 10, where it is the only feature.
     assert 9 * PLANE_SIZE + 192 + (60 ^ MIRROR) not in w
+    assert PLANE_SIZE * 10 + 64 * 3 + (60 ^ MIRROR) in w
+    # ... and the own (white) king's square must not appear on plane 10
+    # either.
+    assert PLANE_SIZE * 10 + 64 * 3 + (4 ^ MIRROR) not in w
+    # Exactly one plane-10 entry per side.
+    assert sum(1 for i in w if i >= PLANE_SIZE * 10) == 1
+    assert sum(1 for i in b if i >= PLANE_SIZE * 10) == 1
     # Black rooks a8/h8 (56->63, 63->56) as opponents: plane 8.
     assert 8 * PLANE_SIZE + 192 + 56 in w
     assert 8 * PLANE_SIZE + 192 + 63 in w
@@ -158,19 +170,49 @@ def test_initial_position_black_features():
     assert 5 * PLANE_SIZE + 64 * 3 + 55 in b
     # White queen d1 (3 -> 60) as opponent (plane 9):
     assert 9 * PLANE_SIZE + 64 * 3 + 60 in b
+    # Opponent (white) king e1 (4 -> 4 ^ 0x3f = 63) on plane 10, in
+    # the black frame.
+    assert PLANE_SIZE * 10 + 64 * 3 + (4 ^ (FLIP | MIRROR)) in b
 
 
-def test_bare_kings_no_features():
-    """With no pieces on the board there are no active features at all:
-    the kings themselves are not piece features and the opponent king
-    is not a plane anymore.  The accumulators are just the input bias.
+def test_opponent_king_plane():
+    """Plane 10 = the opponent king in the side's own canonical frame:
+    idx = PLANE_SIZE * 10 + 64 * king_index + (opp_king_sq ^ flip),
+    with the frame (flip, king_index) of the side being evaluated.
+    """
+    # Starting position: white king e1 (sq 4) -> mirrored frame
+    # (flip MIRROR, king_index 3); black king e8 (sq 60).
+    board = _board_from_epd(INIT)
+    w, b = feature_indices(board)
+    w_flip, w_king = canonical_frame(WHITE, 4)
+    b_flip, b_king = canonical_frame(BLACK, 60)
+    assert (w_flip, w_king) == (MIRROR, 3)
+    assert (b_flip, b_king) == (FLIP | MIRROR, 3)
+    assert PLANE_SIZE * 10 + 64 * w_king + (60 ^ w_flip) in w
+    assert PLANE_SIZE * 10 + 64 * b_king + (4 ^ b_flip) in b
+    # Left-half kings: no rank flip, no mirror.
+    board = _board_from_epd("3k4/8/8/8/8/8/8/3K4 w - -")
+    w, b = feature_indices(board)
+    # White king d1 -> king_index 3; black king d8 (59) unflipped.
+    assert w.tolist() == [PLANE_SIZE * 10 + 64 * 3 + 59]
+    # Black frame: king d8 (59 -> 3) -> king_index 3; white king d1
+    # (3 -> 3 ^ 0x38 = 59).
+    assert b.tolist() == [PLANE_SIZE * 10 + 64 * 3 + 59]
 
-    Kings e1/e8 (both on file e -> both frames mirrored) would give
-    king_index 3 for both sides, but nothing else."""
+
+def test_bare_kings_only_opponent_king():
+    """With only kings on the board, the sole active piece feature of
+    each side is the opponent king (plane 10); the own king is not a
+    feature and no pawn pair features are active.
+
+    Kings e1/e8 (both on file e -> both frames mirrored) give
+    king_index 3 for both sides."""
     board = _board_from_epd("4k3/8/8/8/8/8/8/4K3 w - -")
     w, b = feature_indices(board)
-    assert w.tolist() == []
-    assert b.tolist() == []
+    # White frame: flip MIRROR, king_index 3; black king e8 (60).
+    assert w.tolist() == [PLANE_SIZE * 10 + 64 * 3 + (60 ^ MIRROR)]
+    # Black frame: flip FLIP | MIRROR, king_index 3; white king e1 (4).
+    assert b.tolist() == [PLANE_SIZE * 10 + 64 * 3 + (4 ^ (FLIP | MIRROR))]
 
 
 def test_left_and_right_half_kings_share_features():
@@ -203,15 +245,24 @@ def test_mirrored_board_has_identical_features():
 
 def test_max_index_at_corner():
     # White king d8 (canonical, no mirror), black queen h8: plane 9
-    # (opponent queen), king_index 31, square 63 -> the last feature
-    # index.
+    # (opponent queen), king_index 31, square 63.  The plane-10
+    # (black king a1, square 0) index is the second feature; the
+    # overall maximum index (plane 10, king_index 31, square 63) is
+    # N_FEATURES - 1.
     board = _board_from_epd("3K3q/8/8/8/8/8/8/k7 w - -")
     w, b = feature_indices(board)
-    assert w == [PLANE_SIZE * 9 + 64 * 31 + 63] == [N_FEATURES - 1]
+    assert set(w.tolist()) == {
+        PLANE_SIZE * 9 + 64 * 31 + 63,  # black queen h8
+        PLANE_SIZE * 10 + 64 * 31 + 0,  # black king a1
+    }
     # Black frame: king a1 (0) -> perspective a8 (king_index 28); own
     # queen h8 (63) -> 63 ^ 0x38 = 7 (h1), own queen plane 4.  The
-    # white king (d8 -> d1) is not a feature.
-    assert b == [PLANE_SIZE * 4 + 64 * 28 + 7]
+    # white king (d8 -> 3 ^ 0x38 = 3, d1) is plane 10 in the black
+    # frame.
+    assert set(b.tolist()) == {
+        PLANE_SIZE * 4 + 64 * 28 + 7,  # own queen, h1 in black frame
+        PLANE_SIZE * 10 + 64 * 28 + 3,  # white king d8 -> d1
+    }
 
 
 def test_black_perspective_matches_flipped_white():

@@ -9,6 +9,8 @@ import mlx.core as mx  # noqa: E402
 from amy_training_nnue.dataset import MAX_FEATURES, MAX_PAWN_FEATURES  # noqa: E402
 from amy_training_nnue.features import (  # noqa: E402
     FLIP,
+    N_FEATURES,
+    PLANE_SIZE,
     feature_indices,
     pawn_feature_indices,
 )
@@ -139,3 +141,19 @@ def test_save_load(tmp_path):
         loaded(mx.array(fw), mx.array(fb), mx.array(pfw), mx.array(pfb), mx.array([0]))
     )
     assert o1 == o2
+
+
+def test_load_rejects_stale_checkpoint(tmp_path):
+    """A checkpoint from the pre-plane-10 layout (one plane,
+    PLANE_SIZE rows, fewer input features than today's N_FEATURES)
+    must be rejected with a clear error instead of silently loading
+    mismatched tensors."""
+    model = NnueNet(seed=1)
+    model.save(tmp_path)
+    # Rewrite input_w with the old (10-plane) size.
+    with np.load(tmp_path / "weights.npz") as z:
+        params = {k: z[k] for k in z.files}
+    params["input_w"] = params["input_w"][: N_FEATURES - PLANE_SIZE]
+    np.savez(tmp_path / "weights.npz", **params)
+    with pytest.raises(ValueError, match="stale checkpoint"):
+        NnueNet.load(tmp_path)

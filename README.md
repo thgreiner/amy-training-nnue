@@ -13,7 +13,7 @@ The network mirrors amy's C implementation (`src/neural_net.c`) exactly:
 
 | Stage | amy C | Python |
 |---|---|---|
-| Features | 20480 king-relative features in a canonical frame per side: 10 piece types (5 own + 5 opponent) x 32 canonical king positions x 64 squares, index `2048*plane + 64*king_index + sq'`; the kings are not features, they only define the frame. Each frame is rank-flipped for black (`sq ^ 0x38`) and, if the own king stands on files e..h, mirrored horizontally (`sq ^ 0x07`), so the king is always in the left half; `king_index` = file + 4*rank of the canonical king (a1 = 0 ... d8 = 31). Plus 4560 pawn *pair* features: one per unordered pair of the 96 color-square ids (`hi*(hi-1)/2 + lo`), only 1488 ever active (the two pawns within one file of distance), indexed in each side's own frame; both sides read the same shared matrix | `amy_training_nnue/features.py` |
+| Features | 22528 king-relative features in a canonical frame per side: 10 piece types (5 own + 5 opponent) + the opponent king (plane 10) x 32 canonical king positions x 64 squares, index `2048*plane + 64*king_index + sq'` (the own king is not a feature; it only defines the frame). Each frame is rank-flipped for black (`sq ^ 0x38`) and, if the own king stands on files e..h, mirrored horizontally (`sq ^ 0x07`), so the king is always in the left half; `king_index` = file + 4*rank of the canonical king (a1 = 0 ... d8 = 31). Plus 4560 pawn *pair* features: one per unordered pair of the 96 color-square ids (`hi*(hi-1)/2 + lo`), only 1488 ever active (the two pawns within one file of distance), indexed in each side's own frame; both sides read the same shared matrix | `amy_training_nnue/features.py` |
 | Accumulator | per-side int16 vector of 256 (units of 1/64), clamped to `[0, 64]` at evaluation | `model.py` (float), `quantize.py` (int16) |
 | Network | 2x256 -> 32 -> 32 -> 1; h1 clamped ReLU `(h + 4095) / 8192` in `[0, 64]`, h2 `(h + 31) / 64` in `[0, 8192]` | `model.py` (float, `SCALE_INPUT_HALF` clamps), `quantize.py` (integer) |
 | Output | `((out + 4095) / 8192) * 10000` then `(r + 4095) / 8192` -> millipawns, C truncating division | same, `quantize.py` |
@@ -28,7 +28,7 @@ uses `int16` x 8192 weights with an `int32` x 64 x 8192 bias (activations in
 bias (activations in [0, 8192]), and the output layer `int32` x 8192 /
 `int32` x 8192^2. `QuantizedNet` in `quantize.py` simulates that integer
 pipeline bit-exactly and is used to report quantized metrics. The file is
-6,445,980 bytes (24-byte header + fields, including the 1,167,360-byte
+6,970,268 bytes (24-byte header + fields, including the 1,167,360-byte
 shared pawn block after the piece input weights).
 
 ## Setup
@@ -119,8 +119,8 @@ On the 3.28M-record selfplay log (`../amy/evaluation_log.bin`), 30 epochs,
 AdamW lr=1e-3, batch 2048, seed 0, on an M1 Pro. Metrics on the full log
 (`python -m amy_training_nnue evaluate`, 10-plane net). *These numbers
 are from the previous (45056-feature, unmirrored) architecture; the net
-must be retrained on the current 20480-feature king-half features (no
-opponent-king plane) and the new hidden-1 quantization.*
+must be retrained on the current 22528-feature king-half features (with
+the opponent-king plane 10) and the new hidden-1 quantization.*
 
 ```
 quantized: rmse 213 mp, mae 152 mp, corr 0.9911, r2 0.9823, within 25cp 1.000

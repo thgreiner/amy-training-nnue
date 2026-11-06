@@ -40,13 +40,15 @@ emits the `network.quant` file amy loads at startup.
   commute.  A position and its horizontal mirror image therefore produce
   identical feature vectors.
 - Feature index: `2048 * plane + 64 * king_index + sq'`, planes 0..4 =
-  own P N B R Q, 5..9 = opponent P N B R Q (the kings are *not*
-  features; they only define the frame; see `nn_build_accumulator()`
-  in neural_net.c).  `king_index` = file + 4 * rank of the canonical
+  own P N B R Q, 5..9 = opponent P N B R Q, 10 = the opponent king in
+  the side's own canonical frame (the own king is not a feature; the
+  opponent king is plane 10; see `nn_build_accumulator()` in
+  neural_net.c).  `king_index` = file + 4 * rank of the canonical
   own king (0..31: a1 = 0 ... d1 = 3, ... a8 = 28 ... d8 = 31);
-  `sq'` is the piece square in the same frame (pieces are not
+  `sq'` is the piece square (for plane 10: the opponent king's
+  square) in the same frame (pieces are not
   restricted to the left half, only the king).  N_FEATURES =
-  10 * 32 * 64 = 20480.
+  11 * 32 * 64 = 22528.
 - Pawn pair features (see `nn_init_pawns()` in neural_net.c): every
   unordered pair of pawns within one file of distance (same file, any
   rank, or adjacent files) contributes one row of a *shared*
@@ -65,7 +67,7 @@ emits the `network.quant` file amy loads at startup.
 
 Any change to the pipeline must be re-validated:
 
-1. `python -m pytest tests/ -q` — 57 tests, including
+1. `python -m pytest tests/ -q` — 59 tests, including
    `tests/test_crosscheck.py`, which compares against C ground truth stored
    in `tests/data/crosscheck_reference.json` (regenerate with
    `python tools/make_crosscheck_reference.py [AMY_DIR]`, which needs
@@ -124,7 +126,7 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
 - Keep the `network.quant` export byte-identical to amy's layout: a
   24-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
   bytes read as "AMYW",
-  then accumulator size 256, number of piece input features 20480,
+  then accumulator size 256, number of piece input features 22528,
   number of pawn input features 4560, hidden layer sizes 32/32,
   per-field quantization codes 1/2/3 = int8/16/32 — input weights 1,
   input bias 2, h1 weights 2, h1 bias 3, h2 weights 2, h2 bias 3,
@@ -132,8 +134,8 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
   are read unconditionally as int8.  See `weights_header()`.  The C
   struct is 22 field bytes + 2 trailing padding — pack with
   `struct.pack("<IHHHHH8B2x", ...)`, a 22-byte pack silently
-  misaligns the whole file) followed by 6,445,956 bytes of fields in
-  `write_network_quant`'s order (6,445,980 bytes total): piece input
+  misaligns the whole file) followed by 6,970,244 bytes of fields in
+  `write_network_quant`'s order (6,970,268 bytes total): piece input
   weights, the shared 4560 x 256 int8 pawn block, input bias, hidden
   and output layers.
 - Style: `black` + `isort` (configured in `pyproject.toml`).

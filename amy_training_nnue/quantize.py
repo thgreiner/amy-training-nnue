@@ -38,7 +38,7 @@ The header (little-endian, 24 bytes, must match neural_net.c's
 WeightsHeader byte-for-byte):
 
     u32 magic 0x57594D41 (file bytes read as "AMYW")
-    u16 accumulator size, u16 number of piece input features (20480),
+    u16 accumulator size, u16 number of piece input features (22528),
     u16 number of pawn input features (4560),
     u16 hidden layer 1 size, u16 hidden layer 2 size
     8 x u8 quantization codes (1 = int8, 2 = int16, 3 = int32), one per

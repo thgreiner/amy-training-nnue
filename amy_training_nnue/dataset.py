@@ -14,8 +14,8 @@ from .bpd import read_records
 from .features import feature_indices, pawn_feature_indices
 
 # Maximum number of active input features per accumulator.  A position
-# has at most 15 own + 15 opponent non-king pieces (30 for a full
-# board); the kings are not features.  32 leaves headroom.
+# has at most 15 own + 15 opponent non-king pieces plus the opponent
+# king (plane 10): 31 for a full board.  32 leaves headroom.
 MAX_FEATURES = 32
 
 # Maximum number of active pawn pair features per accumulator.  At most
