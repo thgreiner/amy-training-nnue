@@ -1,39 +1,41 @@
-"""Load BPD self-play files into a training dataset.
+"""Load BPD selfplay files into a training dataset.
+
+Feature generation is delegated to amy's C feature-extraction
+library (cfeatures): the engine is the reference implementation of
+the index math, so the training data can never drift from it
+(PLAN-attack-map-features.md, T2).  Record validity is decided by
+the same C code (bpd_record_valid); invalid records are dropped
+and counted in ``n_invalid``.
 
 No mirror augmentation: with the king-half canonicalized features
-(see features.py) a position and its horizontal mirror image produce
-identical feature vectors, so augmenting with the mirror would only
-duplicate rows.
+a position and its horizontal mirror image produce identical
+feature vectors, so augmenting with the mirror would only duplicate
+rows.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .bpd import read_records
-from .features import feature_indices, pawn_feature_indices
-
-# Maximum number of active input features per accumulator.  A position
-# has at most 15 own + 15 opponent non-king pieces plus the opponent
-# king (plane 10): 31 for a full board.  32 leaves headroom.
-MAX_FEATURES = 32
-
-# Maximum number of active pawn pair features per accumulator.  At most
-# 16 pawns (8 per side) on 6 squares per file: 6+6+4 on three adjacent
-# files give 96 pairs, so 128 leaves headroom.
-MAX_PAWN_FEATURES = 128
+from . import cfeatures
+from .bpd import RECORD_SIZE
 
 
 class BpdDataset:
     """All positions of one or more BPD files as packed tensors.
 
     Attributes:
-        feat_w: (N, K) int32, white accumulator feature indices,
-            padded with -1.
+        feat_w: (N, K) int32, white accumulator feature indices
+            (own pieces, opponent pieces, opponent king plane 10),
+            padded with -1.  K = the C library's
+            max_piece_features.
         feat_b: (N, K) int32, black accumulator feature indices.
         pfeat_w: (N, P) int32, white pawn pair feature indices,
             padded with -1.
         pfeat_b: (N, P) int32, black pawn pair feature indices.
+        afeat_w: (N, A) int32, white attack map feature indices,
+            padded with -1.
+        afeat_b: (N, A) int32, black attack map feature indices.
         turn:   (N,) uint8, 0 = white to move, 1 = black.
         target: (N,) float32, stored score / target_scale.
         score:  (N,) int32, stored score in millipawns (side to move).
@@ -42,53 +44,39 @@ class BpdDataset:
     def __init__(self, paths: list[str], target_scale: float = 10000.0):
         if not paths:
             raise ValueError("no input files given")
-        boards: list[np.ndarray] = []
-        turns: list[int] = []
-        scores: list[int] = []
-        invalid = 0
+        blocks: list[tuple[cfeatures.Extracted, np.ndarray]] = []
+        n_invalid = 0
         for path in paths:
-            for record in read_records(path):
-                problems = record.validate()
-                if problems:
-                    invalid += 1
-                    continue
-                board = record.board()
-                boards.append(board)
-                turns.append(record.turn)
-                scores.append(record.score)
-        if not boards:
+            raw = np.fromfile(path, dtype=np.uint8)
+            if len(raw) % RECORD_SIZE:
+                raise ValueError(
+                    f"{path}: size {len(raw)} is not a multiple of {RECORD_SIZE}"
+                )
+            n = len(raw) // RECORD_SIZE
+            if n == 0:
+                continue
+            ex = cfeatures.extract(raw, n)
+            keep = ex.valid.astype(bool)
+            n_invalid += n - int(keep.sum())
+            if keep.any():
+                blocks.append((ex, keep))
+        if not blocks:
             raise ValueError(f"no valid records found in {paths}")
 
-        feat_w = np.full((len(boards), MAX_FEATURES), -1, dtype=np.int32)
-        feat_b = np.full((len(boards), MAX_FEATURES), -1, dtype=np.int32)
-        pfeat_w = np.full((len(boards), MAX_PAWN_FEATURES), -1, dtype=np.int32)
-        pfeat_b = np.full((len(boards), MAX_PAWN_FEATURES), -1, dtype=np.int32)
-        for i, board in enumerate(boards):
-            w, b = feature_indices(board)
-            pw, pb = pawn_feature_indices(board)
-            if len(w) > MAX_FEATURES or len(b) > MAX_FEATURES:
-                raise RuntimeError(
-                    f"position {i} has {len(w)}/{len(b)} features > {MAX_FEATURES}"
-                )
-            if len(pw) > MAX_PAWN_FEATURES or len(pb) > MAX_PAWN_FEATURES:
-                raise RuntimeError(
-                    f"position {i} has {len(pw)}/{len(pb)} pawn pair "
-                    f"features > {MAX_PAWN_FEATURES}"
-                )
-            feat_w[i, : len(w)] = w
-            feat_b[i, : len(b)] = b
-            pfeat_w[i, : len(pw)] = pw
-            pfeat_b[i, : len(pb)] = pb
+        def gather(field: str) -> np.ndarray:
+            return np.concatenate([getattr(ex, field)[mask] for ex, mask in blocks])
 
-        self.feat_w = feat_w
-        self.feat_b = feat_b
-        self.pfeat_w = pfeat_w
-        self.pfeat_b = pfeat_b
-        self.turn = np.asarray(turns, dtype=np.uint8)
-        self.score = np.asarray(scores, dtype=np.int32)
+        self.feat_w = gather("feat_w")
+        self.feat_b = gather("feat_b")
+        self.pfeat_w = gather("pfeat_w")
+        self.pfeat_b = gather("pfeat_b")
+        self.afeat_w = gather("afeat_w")
+        self.afeat_b = gather("afeat_b")
+        self.turn = gather("turn")
+        self.score = gather("score")
         self.target = self.score.astype(np.float32) / float(target_scale)
-        self.n = len(boards)
-        self.n_invalid = invalid
+        self.n = sum(int(mask.sum()) for _, mask in blocks)
+        self.n_invalid = n_invalid
 
     def split(self, val_fraction: float = 0.1, seed: int = 0):
         """Shuffle and return (train_idx, val_idx) as int64 arrays."""

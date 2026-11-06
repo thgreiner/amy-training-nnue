@@ -1,0 +1,176 @@
+"""Tests for the C feature-extraction bindings (T2).
+
+The C library is the reference implementation of feature generation;
+these tests pin its ABI and output:
+
+- test_constants: the exported architecture constants.
+- test_golden_bpd_test_bin: the 5-record BPD fixture through the full
+  extraction, compared against a committed golden file (generated
+  from the C library; the hand-computed cases below and the C unit
+  tests in amy-eval-nnue/src/test_nn_extract.c are the independent
+  anchors).
+- test_attack_features_hand_computed: attack plane indices from
+  hand computation, including the pawn-attacks-bishop exclusion.
+- test_invalid_records_cross: C validation (the arbiter) and
+  BpdRecord.validate() agree on a battery of invalid records.
+- test_parity_with_python_features: C piece/pawn indices are
+  bit-identical to the (soon retired) Python oracle on the whole
+  frozen selfplay sample.
+"""
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from amy_training_nnue import cfeatures
+from amy_training_nnue.bpd import (
+    RECORD_SIZE,
+    BpdRecord,
+    encode_board,
+)
+from amy_training_nnue.dataset import BpdDataset
+from amy_training_nnue.features import feature_indices, pawn_feature_indices
+from tests.test_features import _board_from_epd
+
+DATA = Path(__file__).parent / "data"
+
+
+def _active(row):
+    """The front-packed active indices of one feature row."""
+    return row[row >= 0].tolist()
+
+
+def test_constants():
+    k = cfeatures.constants()
+    assert k.n_features == 11 * 32 * 64
+    assert k.n_pawn_features == 4560
+    assert k.n_attack_features == 24 * 64 * 64
+    assert k.accumulator_size == 256
+    assert k.max_piece_features == 36
+    assert k.max_pawn_features == 128
+    assert k.max_attack_features == 32
+
+
+def test_golden_bpd_test_bin():
+    data = (DATA / "bpd_test.bin").open("rb").read()
+    ex = cfeatures.extract(data, len(data) // RECORD_SIZE)
+    golden = json.load((DATA / "nn_extract_golden.json").open())
+    assert len(golden["records"]) == len(ex.valid)
+    for i, rec in enumerate(golden["records"]):
+        assert ex.valid[i] == rec["valid"], i
+        if not rec["valid"]:
+            continue
+        assert ex.turn[i] == rec["turn"]
+        assert ex.score[i] == rec["score"]
+        for field in (
+            "feat_w",
+            "feat_b",
+            "pfeat_w",
+            "pfeat_b",
+            "afeat_w",
+            "afeat_b",
+        ):
+            assert _active(getattr(ex, field)[i]) == rec[field], (i, field)
+
+
+def test_attack_features_hand_computed():
+    def extract_epd(epd, turn, score):
+        board = _board_from_epd(epd)
+        rec = encode_board(board, turn, score)
+        return cfeatures.extract(rec.encode(), 1)
+
+    # White P b4 attacks B c5; the (Bishop, Pawn) direction is
+    # excluded because the pawn attacks the bishop.
+    ex = extract_epd("4k3/8/8/2b5/1P6/8/8/4K3 w - -", 0, 7)
+    assert ex.valid[0] == 1
+    assert (ex.feat_w[0] >= 0).sum() == 3
+    assert (ex.feat_b[0] >= 0).sum() == 3
+    assert (ex.pfeat_w[0] >= 0).sum() == 0
+    # (Pawn, Bishop) = plane 1; white king e1 -> flip 7:
+    # 4096*1 + 64*(25^7) + (34^7)
+    assert _active(ex.afeat_w[0]) == [4096 * 1 + 64 * 30 + 37]
+    assert (ex.afeat_b[0] == -1).all()
+
+    # White N f3 attacks P g5; the black pawn attacks nothing.
+    ex = extract_epd("4k3/8/8/6p3/8/5N2/8/4K3 w - -", 0, -12)
+    assert ex.valid[0] == 1
+    # (Knight, Pawn) = plane 4; 4096*4 + 64*(21^7) + (38^7)
+    assert _active(ex.afeat_w[0]) == [4096 * 4 + 64 * 18 + 33]
+    assert (ex.afeat_b[0] == -1).all()
+
+
+def _records():
+    """(name, epd, turn, score, ep_sq_or_-1) of the validation battery."""
+    return [
+        ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -", 0, 0, -1),
+        ("pawn rank 8", "P3k3/8/8/8/8/8/8/4K3 w - -", 0, 0, -1),
+        ("pawn rank 1", "R3K2P/8/8/8/8/8/8/4k3 w - -", 0, 0, -1),
+        ("no black king", "4K3/8/8/8/8/8/8/8 w - -", 0, 0, -1),
+        ("two white kings", "3Kk3/8/8/8/8/8/8/4K3 w - -", 0, 0, -1),
+        ("EP rank 4", "4k3/8/8/8/8/4P3/8/4K3 b - -", 1, 0, 28),
+        ("EP rank 3", "4k3/8/8/8/4P3/8/4P3/4K3 b - -", 1, 0, 20),
+    ]
+
+
+def test_invalid_records_cross():
+    expected_invalid = {
+        "pawn rank 8",
+        "pawn rank 1",
+        "no black king",
+        "two white kings",
+        "EP rank 4",
+    }
+    for name, epd, turn, score, ep in _records():
+        board = _board_from_epd(epd)
+        rec = encode_board(board, turn, score, ep=ep)
+        ex = cfeatures.extract(rec.encode(), 1)
+        problems = rec.validate()
+        assert ex.valid[0] == (0 if name in expected_invalid else 1), name
+        assert bool(problems) == (name in expected_invalid), (
+            name,
+            problems,
+        )
+        if name in expected_invalid:
+            # Invalid rows are all -1 on every side.
+            for field in (
+                "feat_w",
+                "feat_b",
+                "pfeat_w",
+                "pfeat_b",
+                "afeat_w",
+                "afeat_b",
+            ):
+                assert (getattr(ex, field)[0] == -1).all(), (name, field)
+
+
+def test_parity_with_python_features():
+    """C and the Python oracle must agree bit-for-bit on piece and
+    pawn indices (order-insensitive: accumulator sums are
+    commutative)."""
+    raw = (DATA / "selfplay_sample.bin").read_bytes()
+    n = len(raw) // RECORD_SIZE
+    ex = cfeatures.extract(raw, n)
+    assert ex.valid.all()
+    for i in range(n):
+        rec = BpdRecord.decode(raw, i * RECORD_SIZE)
+        board = rec.board()
+        w, b = feature_indices(board)
+        pw, pb = pawn_feature_indices(board)
+        assert sorted(_active(ex.feat_w[i])) == sorted(w.tolist()), i
+        assert sorted(_active(ex.feat_b[i])) == sorted(b.tolist()), i
+        assert sorted(_active(ex.pfeat_w[i])) == sorted(pw.tolist()), i
+        assert sorted(_active(ex.pfeat_b[i])) == sorted(pb.tolist()), i
+
+
+def test_dataset_smoke():
+    ds = BpdDataset([str(DATA / "selfplay_sample.bin")])
+    k = cfeatures.constants()
+    assert ds.n == 59980
+    assert ds.n_invalid == 0
+    assert ds.feat_w.shape == (ds.n, k.max_piece_features)
+    assert ds.pfeat_w.shape == (ds.n, k.max_pawn_features)
+    assert ds.afeat_w.shape == (ds.n, k.max_attack_features)
+    assert (ds.target == ds.score.astype(np.float32) / 10000.0).all()
+    tr, va = ds.split()
+    assert len(tr) + len(va) == ds.n

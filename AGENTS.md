@@ -153,8 +153,14 @@ amy_training_nnue/
   bpd.py       40-byte record parse/encode, validation
   position.py  Position dataclass, EPD, nibble helpers
   features.py  king-relative feature indices + pawn pair indices
-               (must match neural_net.c)
-  dataset.py   BPD -> padded feature tensors + targets
+               (parity oracle for the C extraction; no longer on
+               the runtime path)
+  cfeatures.py ctypes binding to libamy_nn_extract (built by `make`
+               in ../amy-eval-nnue, or AMY_NN_LIB): batch BPD ->
+               piece/pawn/attack index rows, the C side is the
+               reference implementation and validation arbiter
+  dataset.py   BPD -> padded feature tensors + targets (one C call
+               per file; also stores the attack blocks)
   model.py     NnueNet (MLX float)
   quantize.py  QuantizedNet (int simulation), network.quant I/O
   train.py     training loop, checkpoints, metrics, export

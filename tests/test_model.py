@@ -6,7 +6,6 @@ import pytest
 pytest.importorskip("mlx.core")
 import mlx.core as mx  # noqa: E402
 
-from amy_training_nnue.dataset import MAX_FEATURES, MAX_PAWN_FEATURES  # noqa: E402
 from amy_training_nnue.features import (  # noqa: E402
     FLIP,
     N_FEATURES,
@@ -16,6 +15,11 @@ from amy_training_nnue.features import (  # noqa: E402
 )
 from amy_training_nnue.model import WEIGHT_NAMES, NnueNet  # noqa: E402
 from tests.test_features import _board_from_epd  # noqa: E402
+
+# Padding widths for the synthetic batches below (real dataset widths
+# come from the C feature-extraction constants, see cfeatures.py).
+MAX_FEATURES = 32
+MAX_PAWN_FEATURES = 128
 
 
 def _feats(board, batch=1):

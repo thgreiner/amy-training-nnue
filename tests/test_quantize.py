@@ -10,7 +10,6 @@ import struct
 import numpy as np
 import pytest
 
-from amy_training_nnue.dataset import MAX_FEATURES, MAX_PAWN_FEATURES
 from amy_training_nnue.features import (
     ACCUMULATOR_SIZE,
     HIDDEN_SIZE_1,
@@ -35,6 +34,11 @@ from amy_training_nnue.quantize import (
     write_network_quant,
 )
 from tests.test_features import _board_from_epd
+
+# Padding widths for the synthetic batches below (real dataset widths
+# come from the C feature-extraction constants, see cfeatures.py).
+MAX_FEATURES = 32
+MAX_PAWN_FEATURES = 128
 
 
 def _feats(board):

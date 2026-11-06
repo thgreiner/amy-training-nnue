@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 
 from amy_training_nnue.bpd import BLACK, WHITE
-from amy_training_nnue.dataset import MAX_FEATURES, MAX_PAWN_FEATURES
 from amy_training_nnue.features import (
     ACCUMULATOR_SIZE,
     HIDDEN_SIZE_1,
@@ -29,6 +28,11 @@ from amy_training_nnue.features import (
     pawn_feature_indices,
 )
 from amy_training_nnue.quantize import QuantizedNet, quantize_parameters
+
+# Padding widths for the synthetic batches below (real dataset widths
+# come from the C feature-extraction constants, see cfeatures.py).
+MAX_FEATURES = 32
+MAX_PAWN_FEATURES = 128
 
 DATA = Path(__file__).parent / "data" / "crosscheck_reference.json"
 
