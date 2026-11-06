@@ -1,9 +1,35 @@
 # amy-training-nnue — agent guide
 
-Training app for amy's NNUE (branch `feature/king-half-mirrored`,
+Training app for amy's NNUE (branch `feature/neural-network-with-pawns`,
 checked out at `../amy-eval-nnue`). Reads amy selfplay BPD logs, trains a
 float network with MLX, quantizes it into amy's exact integer pipeline, and
 emits the `network.quant` file amy loads at startup.
+
+## Feature generation: C is the source of truth
+
+Feature indices (piece planes, pawn pairs, attack maps) are generated
+by the C engine, not by Python:
+
+- `nn_compute_piece_indices` / `nn_compute_pawn_indices`
+  (`neural_net.c`) and `am_compute_attack_indices` (`attack_map.c`)
+  are the single definitions, shared by the engine (accumulator
+  rebuild) and the feature-extraction library `nn_extract.c`.
+  `dataset.py` builds its tensors through that library
+  (`cfeatures.py`; `libamy_nn_extract.dylib`/`.so` built by `make` in
+  the amy checkout, override with `AMY_NN_LIB`).
+- `features.py` (king-relative indices, pawn pairs) is a **parity
+  oracle only** — it is not on the runtime path and will be retired
+  once the cross-check no longer needs it
+  (PLAN-attack-map-features.md T3/T4).  Its index formulas describe
+  the C implementation; keep the two in lockstep until retirement.
+- Architecture constants: the C library's `nn_export_constants` is
+  the arbiter; the Python literals (`features.py`, the `cfeatures.py`
+  row-width caps) are checked against it by
+  `tests/test_cfeatures.py::test_constants_sync`.
+- BPD validation: C's `bpd_record_valid` (`nn_extract.c`) is the
+  arbiter for what may enter the training data;
+  `BpdRecord.validate()` mirrors it, cross-tested in
+  `tests/test_cfeatures.py::test_invalid_records_cross`.
 
 ## Hard invariant: bit-exact with amy's C
 
@@ -67,11 +93,14 @@ emits the `network.quant` file amy loads at startup.
 
 Any change to the pipeline must be re-validated:
 
-1. `python -m pytest tests/ -q` — 59 tests, including
+1. `python -m pytest tests/ -q` — 68 tests, including
    `tests/test_crosscheck.py`, which compares against C ground truth stored
    in `tests/data/crosscheck_reference.json` (regenerate with
    `python tools/make_crosscheck_reference.py [AMY_DIR]`, which needs
    `src/nn_crosscheck` built by a plain `make` in the amy checkout).
+   The reference also freezes the engine's per-position piece/pawn/attack
+   index sets (checked in `test_crosscheck.py` against the Python oracle
+   and the C extraction library).
 2. For export changes: copy `network.quant` into a scratch dir, run
    `Amy --test` there (all tests must pass), and compare
    `nn_crosscheck` scores with `QuantizedNet.evaluate`.

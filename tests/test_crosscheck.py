@@ -1,14 +1,16 @@
 """Bit-exact cross-check against amy's C implementation.
 
-tests/data/crosscheck_reference.json holds the accumulators and scores
-produced by amy's own neural_net.c (branch
-feature/king-half-mirrored, src/nn_crosscheck.c) for a random
-in-range network generated with a fixed seed.  The Python
-QuantizedNet must reproduce every value, including int16 wrap-around,
-the [0, 64] and [0, 8192] clamps, and the two-step rounded output
-transform.  Regenerate the reference with
-tools/make_crosscheck_reference.py (built by make in the amy
-checkout).
+tests/data/crosscheck_reference.json holds the accumulators, scores
+and feature index sets (piece, pawn, attack) produced by amy's own
+neural_net.c (branch feature/king-half-mirrored, src/nn_crosscheck.c)
+for a random in-range network generated with a fixed seed.  The Python
+QuantizedNet must reproduce every accumulator value and score,
+including int16 wrap-around, the [0, 64] and [0, 8192] clamps, and the
+two-step rounded output transform.  The piece/pawn index sets are
+checked against the Python oracle (features.py), and the attack index
+sets (C-only by design) against the C extraction library.  Regenerate
+the reference with tools/make_crosscheck_reference.py (built by make
+in the amy checkout).
 """
 
 import json
@@ -17,7 +19,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from amy_training_nnue.bpd import BLACK, WHITE
+from amy_training_nnue import cfeatures
+from amy_training_nnue.bpd import BLACK, WHITE, encode_board
 from amy_training_nnue.features import (
     ACCUMULATOR_SIZE,
     HIDDEN_SIZE_1,
@@ -139,3 +142,40 @@ def test_scores_match_c(reference):
             )[0]
         )
         assert score == ref["score"], f"{ref['epd']}: {score} != {ref['score']}"
+
+
+def test_indices_match_c(reference):
+    """The engine's piece/pawn index sets (frozen in the reference)
+    must match the Python oracle (features.py).  Pinned via the
+    reference, so this test needs no C library: it verifies the C1
+    shared index generation against the legacy Python implementation
+    for every cross-check position (order-insensitive: accumulator
+    sums are commutative)."""
+    for ref in reference["positions"]:
+        board = _board_from_epd(ref["epd"])
+        fw, fb = feature_indices(board)
+        pfw, pfb = pawn_feature_indices(board)
+        assert sorted(fw.tolist()) == sorted(ref["feat_w"]), ref["epd"]
+        assert sorted(fb.tolist()) == sorted(ref["feat_b"]), ref["epd"]
+        assert sorted(pfw.tolist()) == sorted(ref["pfeat_w"]), ref["epd"]
+        assert sorted(pfb.tolist()) == sorted(ref["pfeat_b"]), ref["epd"]
+
+
+def test_attack_indices_match_extraction(reference):
+    """The attack index sets dumped by the engine (frozen in the
+    reference) must be reproduced by the feature extraction library
+    on the same positions.  Attacks have no Python oracle by design
+    (C is the source of truth); this test pins the reference values
+    and cross-checks the two C entry points (the engine's
+    am_compute_attack_indices vs the ctypes library's)."""
+    for ref in reference["positions"]:
+        board = _board_from_epd(ref["epd"])
+        turn = WHITE if " w " in ref["epd"] else BLACK
+        rec = encode_board(board, turn, 0)
+        assert rec.validate() == [], ref["epd"]
+        ex = cfeatures.extract(rec.encode(), 1)
+        assert ex.valid[0] == 1, ref["epd"]
+        active_w = ex.afeat_w[0][ex.afeat_w[0] >= 0].tolist()
+        active_b = ex.afeat_b[0][ex.afeat_b[0] >= 0].tolist()
+        assert sorted(active_w) == sorted(ref["afeat_w"]), ref["epd"]
+        assert sorted(active_b) == sorted(ref["afeat_b"]), ref["epd"]

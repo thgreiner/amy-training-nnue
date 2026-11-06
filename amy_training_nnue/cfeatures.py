@@ -26,6 +26,14 @@ import numpy as np
 # bpd.RECORD_STRUCT.size and amy's struct BinaryPosition.
 RECORD_SIZE = 40
 
+# The feature-generation caps of the C library's ABI (nn_extract.h /
+# neural_net.h): the row widths of the padded output arrays.  Python
+# literals, kept in sync by test_cfeatures.test_constants_sync,
+# which compares them against the live nn_export_constants() values.
+MAX_PIECE_FEATURES = 36
+MAX_PAWN_FEATURES = 128
+MAX_ATTACK_FEATURES = 32
+
 
 class NnExtractError(RuntimeError):
     """The C library is missing or failed."""

@@ -1,7 +1,7 @@
 # Plan: attack-map features + C feature generation for training
 
-Status: **in progress** — T0 and T2 done (see Progress log); T1, T3,
-T4, T5 open.
+Status: **in progress** — T0, T2 and T3a done (see Progress log); T1,
+T3b, T4, T5 open.
 Target branch: `feature/neural-network-with-pawns` (repo `amy-eval-nnue`; the
 original `feature/king-half-mirrored` target was superseded).
 Date: 2026-02-25
@@ -147,14 +147,44 @@ order-of-magnitude target.
 
 ### T3 — Sync & validation machinery
 
-- [ ] Extend `nn_crosscheck.c` to dump all index sets (piece, pawn,
+- [x] Extend `nn_crosscheck.c` to dump all index sets (piece, pawn,
       attack); regenerate `tests/data/crosscheck_reference.json`;
-      `test_crosscheck.py` covers the new sets.
-- [ ] Constants sync test: C-exported constants vs Python constants
+      `test_crosscheck.py` covers the new sets.  **Done (T3a,
+      2026-11-06):** the dump appends `FEAT W/B n …`, `PFEAT W/B n …`,
+      `AFEAT W/B n …` lines per position; `make_crosscheck_reference.py`
+      parses them into `feat_w/feat_b/pfeat_w/pfeat_b/afeat_w/afeat_b`;
+      new `test_indices_match_c` (Python oracle vs the frozen
+      reference — no library needed) and
+      `test_attack_indices_match_extraction` (reference vs the C
+      extraction library).  The "random attack weights" variant stays
+      in T3b (needs the T4/T5 format pair).
+- [x] Constants sync test: C-exported constants vs Python constants
       (machine-checked invariant, replaces doc-level "must match").
-- [ ] Update `AGENTS.md` invariants to reflect C-as-source-of-truth.
+      **Done (T3a):** `test_constants_sync` compares
+      `nn_export_constants` against `features.py` (`N_FEATURES`,
+      `N_PAWN_FEATURES`, the new `N_ATTACK_FEATURES`,
+      `ACCUMULATOR_SIZE`) and the `cfeatures.py` ABI cap literals
+      (`MAX_PIECE/PAWN/ATTACK_FEATURES`).
+- [x] Update `AGENTS.md` invariants to reflect C-as-source-of-truth.
+      **Done (T3a):** new "Feature generation: C is the source of
+      truth" section (shared C index functions, the `cfeatures` path,
+      `features.py` as parity oracle, `nn_export_constants` and
+      `bpd_record_valid` as arbiters); branch name corrected in
+      AGENTS.md and README.
 
-Gate: full pytest; cross-check against a freshly built `nn_crosscheck`.
+Gate (met 2026-11-06): full pytest 68/68; cross-check against a
+freshly built `nn_crosscheck` (reference regenerated: acc/score/turn
+identical, new index fields added and verified, incl. a hand-
+computed attack case).  Note: T3a surfaced a real bug —
+`nn_extract_features` never called `init_all()`, so the magic
+bitboard tables (bishop/rook/queen attacks) were empty in the
+standalone dylib and sliding-piece attack features were silently
+missing (knight/pawn attacks use compile-time const tables, which is
+why only these broke).  Fixed with a one-time `init_all()` guard in
+`nn_extract.c`; a hand-computed bishop-attack case in
+`test_attack_features_hand_computed` pins the path.  Any training
+data extracted before the fix lacks sliding-piece attack rows and
+must be re-extracted.
 
 ### T4 — Training pipeline for attack features
 
@@ -207,9 +237,9 @@ and changes evaluation (non-zero contribution).
 - **Cross-check pinning of the attack block**: `nn_crosscheck` loads the
   Python-exported `network.quant`, which has no attack block until T4/T5
   land — the C-side attack matrix is zero there, so the existing
-  bit-exact comparison is unaffected.  T3 must extend the dump (attack
-  indices, and a variant with random attack weights) once the format
-  pairs up.
+  bit-exact comparison is unaffected.  T3a extended the dump with the
+  per-position index sets (piece/pawn/attack); the variant with random
+  attack weights lands in T3b once the format pairs up.
 - **Pawn-rank validation**: `BpdRecord.validate` rules are duplicated in C
   (T2) — keep the cross-test, it is the drift guard.
 
@@ -287,4 +317,28 @@ and changes evaluation (non-zero contribution).
     3.4 s for 59,980 records).
   Open within T2: none.  Next: T3 (sync & validation machinery),
   then T4/T5 (training + C loader for the attack block).
+- 2026-11-06: T3a done (sync & validation machinery; the random-
+  attack-weights variant remains T3b, after T4/T5).
+  - `nn_crosscheck.c` now dumps the full per-position index sets
+    (`FEAT`/`PFEAT`/`AFEAT W|B n …`); the reference JSON carries
+    `feat_w/feat_b/pfeat_w/pfeat_b/afeat_w/afeat_b`; acc/score/turn
+    values unchanged.  `test_crosscheck.py` gains
+    `test_indices_match_c` (Python oracle vs frozen reference, no
+    library) and `test_attack_indices_match_extraction` (reference vs
+    the C extraction library on the same positions).
+  - `test_constants_sync`: C-exported constants vs `features.py`
+    (incl. new `N_ATTACK_FEATURES = 24 * 64 * 64`) and the new
+    `cfeatures.MAX_PIECE/PAWN/ATTACK_FEATURES` ABI literals — the
+    machine-checked C-is-source-of-truth invariant.
+  - AGENTS.md: new "Feature generation: C is the source of truth"
+    section; branch name corrected (AGENTS.md + README).
+  - Bug found & fixed: `nn_extract_features` (nn_extract.c) never ran
+    `init_all()`, so the magic bitboard tables were empty in the
+    standalone dylib — bishop/rook/queen attack features were
+    silently missing (knight/pawn attacks use compile-time const
+    tables).  One-time `init_all()` guard added; new hand-computed
+    bishop-attack case in `test_attack_features_hand_computed` pins
+    it.  Training data extracted before this fix must be
+    re-extracted.
+  Gate: `Amy --test` green; 68/68 pytest.
 

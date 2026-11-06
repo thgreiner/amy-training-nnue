@@ -72,6 +72,13 @@ N_FEATURES = 11 * 32 * 64  # 22528
 N_PAWN_SQUARES = 48  # ranks 2..7 of one frame
 N_PAWN_IDS = 2 * N_PAWN_SQUARES  # 96
 N_PAWN_FEATURES = N_PAWN_IDS * (N_PAWN_IDS - 1) // 2  # 4560
+# Attack features: 24 planes (attacker P..Q x victim P..Q, minus
+# pawn->pawn and all king attacks), each indexed by (attacker square,
+# victim square) in the side's canonical frame: 64 x 64, i.e. not
+# king-relative (see attack_map.c in the engine; test_nn_extract.c
+# pins the plane numbering).
+ATTACK_PLANE_SIZE = 64 * 64  # 4096
+N_ATTACK_FEATURES = 24 * ATTACK_PLANE_SIZE  # 98304
 ACCUMULATOR_SIZE = 256
 HIDDEN_SIZE_1 = 32
 HIDDEN_SIZE_2 = 32

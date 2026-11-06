@@ -3,7 +3,7 @@
 Training application for amy's NNUE evaluation function.
 
 Trains the weights of the neural network used by amy's
-`feature/king-half-mirrored` branch from amy selfplay data in
+`feature/neural-network-with-pawns` branch from amy selfplay data in
 [BPD format](https://github.com/thgreiner/amy), and exports the raw
 `network.quant` weight file that amy loads at startup.
 
@@ -101,7 +101,7 @@ The Python pipeline is verified **bit-exact** against amy's C code:
 Regenerate the cross-check reference (needs the amy NNUE checkout):
 
 ```bash
-# in the amy checkout (feature/king-half-mirrored):
+# in the amy checkout (feature/neural-network-with-pawns):
 make            # builds src/Amy and src/nn_crosscheck
 # then:
 python tools/make_crosscheck_reference.py [AMY_DIR]

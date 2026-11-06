@@ -94,6 +94,25 @@ while i < len(lines):
         assert lines[i].startswith("SCOREI ")
         assert int(lines[i].split()[-1]) == score
         i += 1
+        # The six feature index sets dumped by nn_crosscheck.c (the
+        # engine's own generation).  FEAT = piece, PFEAT = pawn pair,
+        # AFEAT = attack.
+        idx = {}
+        for _ in range(6):
+            tok = lines[i].split()
+            key = {"FEAT": "feat", "PFEAT": "pfeat", "AFEAT": "afeat"}[tok[0]]
+            key += "_w" if tok[1] == "W" else "_b"
+            assert int(tok[2]) == len(tok) - 3, tok
+            idx[key] = [int(x) for x in tok[3:]]
+            i += 1
+        assert sorted(idx) == [
+            "afeat_b",
+            "afeat_w",
+            "feat_b",
+            "feat_w",
+            "pfeat_b",
+            "pfeat_w",
+        ]
         ref["positions"].append(
             {
                 "epd": EPS[n],
@@ -101,6 +120,7 @@ while i < len(lines):
                 "score": score,
                 "acc_w": acc_w.tolist(),
                 "acc_b": acc_b.tolist(),
+                **idx,
             }
         )
     else:
