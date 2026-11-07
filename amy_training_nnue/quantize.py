@@ -1,7 +1,7 @@
 """Quantize a trained float network to amy's network.quant format and
 evaluate it with the exact integer arithmetic of neural_net.c.
 
-network.quant is a 28-byte little-endian header (the WeightsHeader
+network.quant is a 92-byte little-endian header (the WeightsHeader
 struct of neural_net.c, see weights_header()) followed by, in order:
 
     input_layer_weights_q  int8   [N_FEATURES][ACCUMULATOR_SIZE]
@@ -37,7 +37,7 @@ are kept within [-1, 1] during training, so no clipping in practice);
 the int16 hidden 1 weights at scale 8192 cover +-4.0.  Out-of-range
 values are clipped (with a warning) so the file stays loadable by amy.
 
-The header (little-endian, 28 bytes, must match neural_net.c's
+The header (little-endian, 92 bytes, must match neural_net.c's
 WeightsHeader byte-for-byte):
 
     u32 magic 0x57594D41 (file bytes read as "AMYW")
@@ -50,7 +50,10 @@ WeightsHeader byte-for-byte):
     8 x u8 quantization codes (1 = int8, 2 = int16, 3 = int32), one per
     piece field in the same order as the fields above; the pawn and
     attack weights have no code (int8 at the input scale, see above)
-    (the 28 field bytes exactly fill the C struct, no trailing padding)
+    char[32] name (the network codename, NUL-terminated; written via
+    codename() in code_name.py)
+    char[32] date (training date/time, ISO8601, NUL-terminated)
+    (the 92 field bytes exactly fill the C struct, no trailing padding)
 """
 
 from __future__ import annotations
@@ -59,10 +62,12 @@ import json
 import struct
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
+from .code_name import codename
 from .features import (
     ACCUMULATOR_SIZE,
     HIDDEN_SIZE_1,
@@ -103,8 +108,9 @@ QUANT_INT16 = 2
 QUANT_INT32 = 3
 # u32 magic, 3 x u16 sizes (accumulator, piece features, pawn
 # features), 2 bytes of padding, u32 attack features, 2 x u16 sizes
-# (h1, h2), 8 x u8 quant codes.  Exactly fills the C struct.
-HEADER_FORMAT = "<IHHH2xIHH8B"
+# (h1, h2), 8 x u8 quant codes, char[32] name, char[32] date.
+# Exactly fills the C struct.
+HEADER_FORMAT = "<IHHH2xIHH8B32s32s"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 _QUANT_CODES = {
@@ -127,8 +133,16 @@ def _header_quant_codes() -> list[int]:
     ]
 
 
-def weights_header() -> bytes:
-    """The 28-byte WeightsHeader of neural_net.c for this architecture."""
+def weights_header(name: str, date_: str) -> bytes:
+    """The 92-byte WeightsHeader of neural_net.c for this architecture.
+
+    name is a short codename and date_ an ISO8601 timestamp (both fit
+    the C struct's char[32] fields, NUL-terminated).
+    """
+    if len(name) > 31:
+        raise ValueError(f"name must fit char[32]: {name!r} is {len(name)} chars")
+    if len(date_) > 31:
+        raise ValueError(f"date must fit char[32]: {date_!r} is {len(date_)} chars")
     return struct.pack(
         HEADER_FORMAT,
         WEIGHTS_HEADER_MAGIC,
@@ -139,6 +153,8 @@ def weights_header() -> bytes:
         HIDDEN_SIZE_1,
         HIDDEN_SIZE_2,
         *_header_quant_codes(),
+        name.encode("ascii"),
+        date_.encode("ascii"),
     )
 
 
@@ -193,13 +209,24 @@ def quantize_parameters(params: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     }
 
 
-def write_network_quant(path: str | Path, quantized: dict[str, np.ndarray]) -> int:
+def write_network_quant(
+    path: str | Path,
+    quantized: dict[str, np.ndarray],
+    name: str | None = None,
+    date_: str | None = None,
+) -> int:
     """Write the quantized network: WeightsHeader followed by amy's raw
-    field layout.  Returns the total byte count."""
+    field layout.  name defaults to a codename and date_ to the
+    current ISO8601 timestamp (full precision, e.g.
+    2021-07-27T16:02:08.070557).  Returns the total byte count."""
     path = Path(path)
+    header = weights_header(
+        name if name is not None else codename(),
+        date_ if date_ is not None else datetime.now().isoformat(),
+    )
     total = HEADER_SIZE
     with open(path, "wb") as f:
-        f.write(weights_header())
+        f.write(header)
         for name, dtype, shape in FIELD_ORDER:
             array = quantized[name].astype(dtype).reshape(shape)
             f.write(array.tobytes())
@@ -224,8 +251,12 @@ def read_network_quant(path: str | Path) -> dict[str, np.ndarray]:
         attack_features,
         h1_size,
         h2_size,
-        *codes,
+        *rest,
     ) = struct.unpack_from(HEADER_FORMAT, data)
+    codes = list(rest[:8])
+    # name and date: char[32] fields, NUL-terminated in the C struct
+    _name = rest[8].rstrip(b"\x00").decode("ascii")
+    _date = rest[9].rstrip(b"\x00").decode("ascii")
     if magic != WEIGHTS_HEADER_MAGIC:
         raise ValueError(
             f"{path}: bad magic {magic:#010x}, expected {WEIGHTS_HEADER_MAGIC:#010x}"

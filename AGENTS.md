@@ -170,7 +170,7 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
   has been removed.  `mirror_board` in position.py remains available for
   tests (e.g. the mirror-folding invariant in test_features.py).
 - Keep the `network.quant` export byte-identical to amy's layout: a
-  28-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
+  92-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
   bytes read as "AMYW",
   then accumulator size 256, number of piece input features 22528,
   number of pawn input features 4560, 2 bytes of alignment padding, the
@@ -179,12 +179,16 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
   quantization codes 1/2/3 = int8/16/32 — input weights 1,
   input bias 2, h1 weights 2, h1 bias 3, h2 weights 2, h2 bias 3,
   output weights 3, output bias 3; the pawn and attack weights have
-  *no* code and are read unconditionally as int8.  See
+  *no* code and are read unconditionally as int8, then `char[32]`
+  `wh_name` (a codename from `codename()` in `code_name.py`,
+  NUL-padded) and `char[32]` `wh_date` (the training date/time, full
+  ISO8601 timestamp,
+  NUL-padded; both written via `write_network_quant`).  See
   `weights_header()`.  The C struct's field bytes + alignment padding
-  exactly fill the 28 bytes — pack with
-  `struct.pack("<IHHH2xIHH8B", ...)`; any other layout silently
-  misaligns the whole file) followed by 32,136,068 bytes of fields in
-  `write_network_quant`'s order (32,136,096 bytes total): piece input
+  exactly fill the 92 bytes — pack with
+  `struct.pack("<IHHH2xIHH8B32s32s", ...)`; any other layout silently
+  misaligns the whole file) followed by 32,136,132 bytes of fields in
+  `write_network_quant`'s order (32,136,160 bytes total): piece input
   weights, the shared 4560 x 256 int8 pawn block, the shared 98,304 x
   256 int8 attack block, input bias, hidden and output layers.
 - Style: `black` + `isort` (configured in `pyproject.toml`).

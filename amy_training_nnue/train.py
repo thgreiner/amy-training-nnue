@@ -164,7 +164,11 @@ def _loss(model, fw, fb, pfw, pfb, afw, afb, turn, target):
     biases the network toward that regime."""
     out = mx.tanh(model(fw, fb, pfw, pfb, afw, afb, turn))
     target = mx.tanh(target)
-    return mx.mean((out - target) ** 2)
+
+    abs_loss = mx.abs(out - target)
+    return mx.mean(mx.power(abs_loss, 2.6))
+
+    # return mx.mean((out - target) ** 2)
 
 
 def train(config: TrainConfig) -> Path:

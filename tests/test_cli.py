@@ -1,12 +1,14 @@
 """End-to-end CLI tests."""
 
+import struct
 import subprocess
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
 
-from amy_training_nnue.quantize import NETWORK_QUANT_SIZE
+from amy_training_nnue.quantize import HEADER_SIZE, NETWORK_QUANT_SIZE
 
 DATA = Path(__file__).parent / "data" / "bpd_test.bin"
 
@@ -63,9 +65,16 @@ def test_train_and_export_and_evaluate(tmp_path):
     assert "positions: 5" in result.stdout
     assert "quantized:" in result.stdout
 
-    # export from a checkpoint produces an identical file
+    # export from a checkpoint produces the same payload; name and date
+    # are per-export metadata (random codename, ISO8601 timestamp now)
     result = run_cli("export", str(final), "--out", str(tmp_path / "nq2.quant"))
-    assert (tmp_path / "nq2.quant").read_bytes() == quant.read_bytes()
+    b1, b2 = quant.read_bytes(), (tmp_path / "nq2.quant").read_bytes()
+    assert b1[HEADER_SIZE:] == b2[HEADER_SIZE:]
+    for b in (b1, b2):
+        name, date_ = struct.unpack_from("<IHHH2xIHH8B32s32s", b, 0)[-2:]
+        assert name.rstrip(b"\x00") != b""
+        t = datetime.fromisoformat(date_.rstrip(b"\x00").decode("ascii"))
+        assert t.date() == date.today()
 
 
 def test_inspect_invalid_position(tmp_path):

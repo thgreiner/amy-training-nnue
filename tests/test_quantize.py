@@ -71,12 +71,14 @@ def test_header_matches_c_struct():
     u32 attack feature count (98304 doesn't fit in a u16), 2 x u16
     hidden layer sizes, then one u8 quantization code per piece field
     (1 = int8, 2 = int16, 3 = int32) in FIELD_ORDER order (the pawn
-    and attack blocks have no code): 1 2 2 3 2 3 3 3.  28 bytes
-    total, matching the C struct layout exactly."""
-    header = weights_header()
-    assert len(header) == HEADER_SIZE == 28
+    and attack blocks have no code): 1 2 2 3 2 3 3 3, then char[32]
+    name and char[32] date.  92 bytes
+    total, matching the C struct layout exactly."
+    """
+    header = weights_header("Test Net", "2026-01-01")
+    assert len(header) == HEADER_SIZE == 92
     assert header == struct.pack(
-        "<IHHH2xIHH8B",
+        "<IHHH2xIHH8B32s32s",
         WEIGHTS_HEADER_MAGIC,
         ACCUMULATOR_SIZE,
         N_FEATURES,
@@ -92,6 +94,8 @@ def test_header_matches_c_struct():
         3,
         3,
         3,
+        b"Test Net",
+        b"2026-01-01",
     )
 
 
