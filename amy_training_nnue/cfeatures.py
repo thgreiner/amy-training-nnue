@@ -9,7 +9,7 @@ re-implementing the index math, so the training data and the engine
 can never drift apart (PLAN-attack-map-features.md, T2).
 
 The library is found via the ``AMY_NN_LIB`` environment variable, or
-in ``../amy-eval-nnue/src`` relative to this repository (dylib on
+in ``../amy-github/src`` relative to this repository (dylib on
 macOS, .so elsewhere).
 """
 
@@ -50,6 +50,7 @@ class NnExtractConstants:
     max_piece_features: int
     max_pawn_features: int
     max_attack_features: int
+    phase_count: int
 
 
 @dataclass
@@ -60,6 +61,11 @@ class Extracted:
     with the active indices and padded with -1.  Records the C
     validation (bpd_record_valid) rejected carry all-(-1) rows and
     ``valid[i] == 0``; their turn/score values are undefined.
+
+    ``phase`` is (n_records, nn_phase_count) int32, the per-record
+    active phase-head 0/1 masks of nn_phase_masks() (the engine's
+    phase of the position plus, at the top of a bucket, the adjacent
+    higher phase); invalid records carry an all-zero row.
     """
 
     feat_w: np.ndarray
@@ -71,6 +77,7 @@ class Extracted:
     turn: np.ndarray
     score: np.ndarray
     valid: np.ndarray
+    phase: np.ndarray
 
 
 class _CConstants(ctypes.Structure):
@@ -82,6 +89,7 @@ class _CConstants(ctypes.Structure):
         ("max_piece_features", ctypes.c_int32),
         ("max_pawn_features", ctypes.c_int32),
         ("max_attack_features", ctypes.c_int32),
+        ("phase_count", ctypes.c_int32),
     ]
 
 
@@ -93,7 +101,7 @@ def _find_lib_path() -> str:
     env = os.environ.get("AMY_NN_LIB")
     if env:
         return env
-    amy_dir = Path(__file__).resolve().parents[2] / "amy-eval-nnue"
+    amy_dir = Path(__file__).resolve().parents[2] / "amy-github"
     for name in ("libamy_nn_extract.dylib", "libamy_nn_extract.so"):
         candidate = amy_dir / "src" / name
         if candidate.exists():
@@ -130,6 +138,7 @@ def _load() -> ctypes.CDLL:
             ptr,  # turn (uint8 *)
             ptr,  # score (int32 *)
             ptr,  # valid (int32 *)
+            ptr,  # phase (int32 *), n_records x phase_count 0/1 masks
         ]
         lib.nn_extract_features.restype = ctypes.c_int
         _lib = lib
@@ -167,6 +176,7 @@ def extract(data: bytes | np.ndarray, n_records: int) -> Extracted:
     turn = np.empty(n_records, dtype=np.uint8)
     score = np.empty(n_records, dtype=np.int32)
     valid = np.empty(n_records, dtype=np.int32)
+    phase = np.empty((n_records, k.phase_count), dtype=np.int32)
 
     if isinstance(data, np.ndarray):
         buf = data.ctypes.data_as(ctypes.c_char_p)
@@ -184,6 +194,7 @@ def extract(data: bytes | np.ndarray, n_records: int) -> Extracted:
         turn.ctypes.data_as(ctypes.c_void_p),
         score.ctypes.data_as(ctypes.c_void_p),
         valid.ctypes.data_as(ctypes.c_void_p),
+        phase.ctypes.data_as(ctypes.c_void_p),
     )
     if n_valid < 0:
         raise NnExtractError(f"nn_extract_features failed: {n_valid}")
@@ -198,4 +209,5 @@ def extract(data: bytes | np.ndarray, n_records: int) -> Extracted:
         turn=turn,
         score=score,
         valid=valid,
+        phase=phase,
     )

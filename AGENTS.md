@@ -1,9 +1,15 @@
 # amy-training-nnue — agent guide
 
-Training app for amy's NNUE (branch `feature/neural-network-with-pawns`,
-checked out at `../amy-eval-nnue`). Reads amy selfplay BPD logs, trains a
-float network with MLX, quantizes it into amy's exact integer pipeline, and
+Training app for amy's NNUE (branch `feature/phase-branches`, checked
+out at `../amy-github`). Reads amy selfplay BPD logs, trains a float
+network with MLX, quantizes it into amy's exact integer pipeline, and
 emits the `network.quant` file amy loads at startup.
+
+The network has **4 independent per-phase hidden/output branches**
+(`NN_PHASE_COUNT`), one per game phase, over a *shared* input side
+(piece/pawn/attack weights, accumulators).  The engine hard-switches
+to the phase of the position at evaluation; training co-trains the
+adjacent phase at bucket boundaries (see "Phase branches" below).
 
 ## Feature generation: C is the source of truth
 
@@ -108,19 +114,50 @@ by the C engine, not by Python:
 
 Any change to the pipeline must be re-validated:
 
-1. `python -m pytest tests/ -q` — 68 tests, including
+1. `python -m pytest tests/ -q` — 76 tests, including
    `tests/test_crosscheck.py`, which compares against C ground truth stored
    in `tests/data/crosscheck_reference.json` (regenerate with
    `python tools/make_crosscheck_reference.py [AMY_DIR]`, which needs
    `src/nn_crosscheck` built by a plain `make` in the amy checkout).
-   The reference also freezes the engine's per-position piece/pawn/attack
-   index sets (checked in `test_crosscheck.py` against the Python oracle
-   and the C extraction library).
+   The reference also freezes the engine's per-position
+   piece/pawn/attack index sets and the `PHASE`/`PMASKS` selection
+   (checked in `test_crosscheck.py` against the Python oracles and the
+   C extraction library).
 2. For export changes: export a `network.quant` and load it in the amy
    checkout — the loader gate is `nn_crosscheck` (bit-exact) or plain
    `Amy` (must print "Read weights.").  Note: `Amy --test` does *not*
    load weights (the `--test` flag exits inside option parsing, before
    `nn_read_weights()`), so it is a build/test-suite gate only.
+
+## Phase branches (shared contract with the engine)
+
+Per-phase hidden layers (amy's `PLAN-phase-branches.md`):
+
+- **Criterion**: total non-pawn pieces, both sides (kings excluded),
+  buckets of three: counts 0..2 → phase 0, 3..5 → 1, 6..8 → 2,
+  9..12 → 3.  C is the arbiter: `nn_phase_index()` / `nn_phase_masks()`
+  in `neural_net.c` (the criterion *and* the buckets *and* the
+  boundary rule); `NN_PHASE_COUNT` is exported via
+  `nn_export_constants` (Python literal in `features.py`, cross-checked
+  by `test_constants_sync`).
+- **`nn_phase_masks()`** = the record's active heads: always
+  `nn_phase_index(p)`, **plus** the higher phase at the top of a
+  bucket (counts 2, 5, 8).  The C extraction API returns the masks per
+  record (`phase` out-param, all-zero for invalid records);
+  `BpdDataset` exposes them as `ds.phase` (N x 4 0/1), with
+  `ds.phase_index` = first active = the engine's hard switch.
+- **Training**: the float net forwards all 4 branches; with mask
+  `a` the prediction is `blended = (sum a*out) / sum a`, and the loss
+  (train.py `_loss`) is the tanh-squeezed |.|^2.6 on the blend **plus
+  the same term per active head**, so co-trained boundary heads cannot
+  drift apart (t+d / t-d would fit the blend with zero loss).
+- **Engine evaluation** uses exactly one branch (`nn_phase_index`;
+  `QuantizedNet.evaluate(..., phase)` mirrors it bit-exactly, with the
+  per-phase block of the selected phase; cross-checked against
+  `nn_crosscheck`'s `PHASE`/`PMASKS` dumps).
+- **No format soft-fallback**: old single-branch `network.quant` files
+  fail the `wh_phase_count` header check (like any header mismatch);
+  the pipeline must always emit the 4-branch format.
 
 ## BPD format
 
@@ -149,8 +186,8 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
 
 - The network structure must stay changeable for experiments: all
   shapes and sizes derive from the constants in `features.py`
-  (`N_FEATURES`, `ACCUMULATOR_SIZE`, `HIDDEN_SIZE_1/2`, `PLANE_SIZE`)
-  and `quantize.py` (`SCALE*`, `FIELD_ORDER`). Never hardcode
+  (`N_FEATURES`, `ACCUMULATOR_SIZE`, `HIDDEN_SIZE_1/2`, `NN_PHASE_COUNT`,
+  `PLANE_SIZE`) and `quantize.py` (`SCALE*`, `FIELD_ORDER`). Never hardcode
   architecture numbers (256, 32, 512, 8192, ...) in library code or
   tests; hand-computed test expectations are expressed in terms of
   those constants. Note that `tests/data/crosscheck_reference.json`
@@ -159,10 +196,11 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
 - Scores are millipawns everywhere on the outside; the float model works in
   units of `1/10000` pawn (`target = score_mp / 10000`, `SCALE_OUTPUT=10000`),
   and the float forward pass and the quantized pipeline stay linear in
-  those units.  The *loss* is the exception: it is MSE on `tanh(out)` vs
+  those units.  The *loss* is the exception: it is |.|^2.6 on `tanh(out)` vs
   `tanh(target)` (see `_loss` in train.py), so the trained outputs are
   squeezed into (-1, 1); float-val metrics are measured in that same
-  squeezed space.
+  squeezed space.  With per-phase branches the loss is taken on the
+  active-head blend plus per-active-head (see "Phase branches").
 - No mirror augmentation: with the king-half canonical frame, a
   position and its horizontal mirror image produce *identical* feature
   vectors (and the same target), so augmenting would only duplicate
@@ -170,7 +208,7 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
   has been removed.  `mirror_board` in position.py remains available for
   tests (e.g. the mirror-folding invariant in test_features.py).
 - Keep the `network.quant` export byte-identical to amy's layout: a
-  92-byte little-endian `WeightsHeader` (magic `0x57594D41`, whose file
+  **96-byte** little-endian `WeightsHeader` (magic `0x57594D41`, whose file
   bytes read as "AMYW",
   then accumulator size 256, number of piece input features 22528,
   number of pawn input features 4560, 2 bytes of alignment padding, the
@@ -178,19 +216,22 @@ positions with pawns on rank 1 or 8: the pawn pair feature index
   a u16, hence the padding), hidden layer sizes 32/32, per-field
   quantization codes 1/2/3 = int8/16/32 — input weights 1,
   input bias 2, h1 weights 2, h1 bias 3, h2 weights 2, h2 bias 3,
-  output weights 3, output bias 3; the pawn and attack weights have
-  *no* code and are read unconditionally as int8, then `char[32]`
-  `wh_name` (a codename from `codename()` in `code_name.py`,
-  NUL-padded) and `char[32]` `wh_date` (the training date/time, full
-  ISO8601 timestamp,
-  NUL-padded; both written via `write_network_quant`).  See
-  `weights_header()`.  The C struct's field bytes + alignment padding
-  exactly fill the 92 bytes — pack with
-  `struct.pack("<IHHH2xIHH8B32s32s", ...)`; any other layout silently
-  misaligns the whole file) followed by 32,136,132 bytes of fields in
-  `write_network_quant`'s order (32,136,160 bytes total): piece input
-  weights, the shared 4560 x 256 int8 pawn block, the shared 98,304 x
-  256 int8 attack block, input bias, hidden and output layers.
+  output weights 3, output bias 3 (shared by all phases); the pawn and
+  attack weights have *no* code and are read unconditionally as int8,
+  then **u16 `wh_phase_count` = 4**, then `char[32]` `wh_name`
+  (a codename from `codename()` in `code_name.py`, NUL-padded)
+  and `char[32]` `wh_date` (the training date/time, full ISO8601
+  timestamp, NUL-padded; both written via `write_network_quant`).
+  See `weights_header()`.  The 94 field bytes are padded to
+  sizeof(WeightsHeader) = 96 (4-byte alignment; sizeof is the
+  arbiter) — pack with
+  `struct.pack("<IHHH2xIHH8BH32s32s2x", ...)`; any other layout
+  silently misaligns the whole file.  Followed by 32,241,680 bytes of
+  field data (32,241,776 bytes total) in `write_network_quant`'s
+  order: piece input weights, the shared 4560 x 256 int8 pawn block,
+  the shared 98,304 x 256 int8 attack block, input bias, then
+  **4 x {h1w, h1b, h2w, h2b, ow, ob}**, one phase at a time (exactly
+  the read loop of `nn_read_weights_quantized()`).
 - Style: `black` + `isort` (configured in `pyproject.toml`).
 - Data lives in `../amy/evaluation_log.bin` (grows with every selfplay
   session — tests must not read it). `tests/data/selfplay_sample.bin` is
@@ -209,13 +250,16 @@ amy_training_nnue/
                (parity oracle for the C extraction; no longer on
                the runtime path)
   cfeatures.py ctypes binding to libamy_nn_extract (built by `make`
-               in ../amy-eval-nnue, or AMY_NN_LIB): batch BPD ->
-               piece/pawn/attack index rows, the C side is the
-               reference implementation and validation arbiter
-  dataset.py   BPD -> padded feature tensors + targets (one C call
-               per file; also stores the attack blocks)
-  model.py     NnueNet (MLX float)
-  quantize.py  QuantizedNet (int simulation), network.quant I/O
+               in ../amy-github, or AMY_NN_LIB): batch BPD ->
+               piece/pawn/attack index rows + per-record phase masks,
+               the C side is the reference implementation and
+               validation arbiter
+  dataset.py   BPD -> padded feature tensors + targets + phase masks
+               (one C call per file; also stores the attack blocks)
+  model.py     NnueNet (MLX float; shared input + 4 per-phase branches,
+               blended call, `heads()` for per-branch outputs)
+  quantize.py  QuantizedNet (int simulation, one Phase per branch),
+               network.quant I/O (96-byte header, 4-branch payload)
   train.py     training loop, checkpoints, metrics, export
   cli.py       stats / inspect / train / export / evaluate
 tests/         pytest suite incl. bit-exact C cross-check

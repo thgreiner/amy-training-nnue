@@ -71,7 +71,7 @@ def test_train_and_export_and_evaluate(tmp_path):
     b1, b2 = quant.read_bytes(), (tmp_path / "nq2.quant").read_bytes()
     assert b1[HEADER_SIZE:] == b2[HEADER_SIZE:]
     for b in (b1, b2):
-        name, date_ = struct.unpack_from("<IHHH2xIHH8B32s32s", b, 0)[-2:]
+        name, date_ = struct.unpack_from("<IHHH2xIHH8BH32s32s2x", b, 0)[-2:]
         assert name.rstrip(b"\x00") != b""
         t = datetime.fromisoformat(date_.rstrip(b"\x00").decode("ascii"))
         assert t.date() == date.today()

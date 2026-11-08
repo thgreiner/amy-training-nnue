@@ -28,6 +28,7 @@ from amy_training_nnue.features import (
     N_ATTACK_FEATURES,
     N_FEATURES,
     N_PAWN_FEATURES,
+    NN_PHASE_COUNT,
     feature_indices,
     pawn_feature_indices,
 )
@@ -55,14 +56,31 @@ def _make_network(seed: int) -> QuantizedNet:
         "input_b": rng.uniform(-1, 1, (ACCUMULATOR_SIZE,)),
         "pawn_w": rng.uniform(-1, 1, (N_PAWN_FEATURES, ACCUMULATOR_SIZE)),
         "attack_w": rng.uniform(-1, 1, (N_ATTACK_FEATURES, ACCUMULATOR_SIZE)),
-        "h1_w": rng.uniform(-2, 2, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
-        "h1_b": rng.uniform(-2, 2, (HIDDEN_SIZE_1,)),
-        "h2_w": rng.uniform(-2, 2, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
-        "h2_b": rng.uniform(-2, 2, (HIDDEN_SIZE_2,)),
-        "out_w": rng.uniform(-1, 1, (HIDDEN_SIZE_2,)),
-        "out_b": rng.uniform(-1, 1, (1,)),
+        "h1_w": rng.uniform(
+            -2, 2, (NN_PHASE_COUNT, 2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)
+        ),
+        "h1_b": rng.uniform(-2, 2, (NN_PHASE_COUNT, HIDDEN_SIZE_1)),
+        "h2_w": rng.uniform(-2, 2, (NN_PHASE_COUNT, HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
+        "h2_b": rng.uniform(-2, 2, (NN_PHASE_COUNT, HIDDEN_SIZE_2)),
+        "out_w": rng.uniform(-1, 1, (NN_PHASE_COUNT, HIDDEN_SIZE_2)),
+        "out_b": rng.uniform(-1, 1, (NN_PHASE_COUNT,)),
     }
     return QuantizedNet.from_arrays(quantize_parameters(params))
+
+
+def _phase_masks(board: np.ndarray) -> list[int]:
+    """Python oracle for nn_phase_masks() (C is the arbiter; this is
+    the cross-check): total non-pawn piece count (both sides),
+    buckets of three (phase = min(count // 3, NN_PHASE_COUNT - 1)),
+    with the adjacent higher phase additionally active at the top of
+    a bucket (counts 2, 5, 8)."""
+    count = int(np.sum((np.abs(board) >= 2) & (np.abs(board) <= 5)))
+    phase = min(count // 3, NN_PHASE_COUNT - 1)
+    masks = [0] * NN_PHASE_COUNT
+    masks[phase] = 1
+    if phase < NN_PHASE_COUNT - 1 and count % 3 == 2:
+        masks[phase + 1] = 1
+    return masks
 
 
 def _board_from_epd(epd: str) -> np.ndarray:
@@ -135,6 +153,19 @@ def test_accumulators_match_c(reference):
     assert np.array_equal(acc_b, np.asarray(ref["acc_b"], dtype=np.int32))
 
 
+def test_phase_matches_oracle(reference):
+    """The engine's phase selection (nn_phase_index) and its active-head
+    masks (nn_phase_masks), frozen in the reference, must match the
+    Python oracle computed from each position's non-pawn piece count.
+    """
+    for ref in reference["positions"]:
+        board = _board_from_epd(ref["epd"])
+        masks = _phase_masks(board)
+        phase = min(j for j, x in enumerate(masks) if x)
+        assert masks == ref["pmasks"], (ref["epd"], masks, ref["pmasks"])
+        assert phase == ref["phase"], (ref["epd"], phase, ref["phase"])
+
+
 def test_scores_match_c(reference):
     """Scores must equal amy's, for every reference position.  The
     attack rows use the engine's frozen attack index sets (C is the
@@ -155,6 +186,7 @@ def test_scores_match_c(reference):
                 _pad_attack(ref["afeat_w"]),
                 _pad_attack(ref["afeat_b"]),
                 np.array([turn], dtype=np.uint8),
+                np.array([ref["phase"]], dtype=np.int32),
             )[0]
         )
         assert score == ref["score"], f"{ref['epd']}: {score} != {ref['score']}"

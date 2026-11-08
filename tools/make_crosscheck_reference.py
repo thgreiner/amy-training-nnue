@@ -1,12 +1,12 @@
 """Regenerate the cross-check reference (tests/data/crosscheck_reference.json).
 
-Re-runs amy's C implementation (src/nn_crosscheck.c in the amy NNUE checkout)
-with a random in-range network generated with a fixed seed, and saves its
-output.  Usage:
+Re-runs amy's C implementation (src/nn_crosscheck.c in the amy NNUE
+checkout) with a random in-range network generated with a fixed seed,
+and saves its output.  Usage:
 
     python tools/make_crosscheck_reference.py [AMY_DIR] [CROSSCHECK_BIN]
 
-Defaults: AMY_DIR=/Users/thorsten/Projects/amy-eval-nnue
+Defaults: AMY_DIR=<sibling amy-github checkout>
 """
 
 import json
@@ -26,20 +26,21 @@ from amy_training_nnue.features import (  # noqa: E402
     N_ATTACK_FEATURES,
     N_FEATURES,
     N_PAWN_FEATURES,
+    NN_PHASE_COUNT,
 )
 from amy_training_nnue.quantize import (  # noqa: E402
     quantize_parameters,
     write_network_quant,
 )
 
-AMY = (
-    Path(sys.argv[1])
-    if len(sys.argv) > 1
-    else Path("/Users/thorsten/Projects/amy-eval-nnue")
-)
+AMY = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT.parent / "amy-github"
 BIN = Path(sys.argv[2]) if len(sys.argv) > 2 else AMY / "src" / "nn_crosscheck"
 OUT = ROOT / "tests" / "data" / "crosscheck_reference.json"
 
+# Must mirror the EPD table of nn_crosscheck.c exactly (same order,
+# same strings): the reference stores EPS[n] against the position with
+# index n in the C dump.  Phases covered: 3, 3, 3, 2, 3, 3, 0,
+# 0/1 (boundary), 1.
 EPS = [
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq -",
@@ -49,6 +50,11 @@ EPS = [
     # Both kings on the left half (non-mirrored frame): the horizontal
     # mirror of the previous EPD.
     "2k1r3/Pppq3p/8/4p3/4r3/1PQ5/1BP4P/1K1R4 w - -",
+    "r7/8/8/8/8/8/4K2k/8 w - -",
+    # 2 non-pawn pieces, top of phase 0 (nn_phase_masks activates
+    # phases 0 and 1).
+    "3r1r2/8/8/8/8/8/4K2k/8 w - -",
+    "2R1r1r1/8/8/8/8/8/4K2k/8 w - -",
 ]
 
 SEED = 1234
@@ -56,19 +62,20 @@ SEED = 1234
 # input_w, pawn_w and attack_w are drawn from [-1, 1]: the range
 # representable by int8 at scale 64 (and the range trained weights are
 # kept in).  Draw order matters: it must mirror _make_network() in
-# tests/test_crosscheck.py.
+# tests/test_crosscheck.py.  The phase branches are fully independent
+# draws, one (h1_w, h1_b, h2_w, h2_b, out_w, out_b) tuple per phase.
 rng = np.random.default_rng(SEED)
 params = {
     "input_w": rng.uniform(-1, 1, (N_FEATURES, ACCUMULATOR_SIZE)),
     "input_b": rng.uniform(-1, 1, (ACCUMULATOR_SIZE,)),
     "pawn_w": rng.uniform(-1, 1, (N_PAWN_FEATURES, ACCUMULATOR_SIZE)),
     "attack_w": rng.uniform(-1, 1, (N_ATTACK_FEATURES, ACCUMULATOR_SIZE)),
-    "h1_w": rng.uniform(-2, 2, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
-    "h1_b": rng.uniform(-2, 2, (HIDDEN_SIZE_1,)),
-    "h2_w": rng.uniform(-2, 2, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
-    "h2_b": rng.uniform(-2, 2, (HIDDEN_SIZE_2,)),
-    "out_w": rng.uniform(-1, 1, (HIDDEN_SIZE_2,)),
-    "out_b": rng.uniform(-1, 1, (1,)),
+    "h1_w": rng.uniform(-2, 2, (NN_PHASE_COUNT, 2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
+    "h1_b": rng.uniform(-2, 2, (NN_PHASE_COUNT, HIDDEN_SIZE_1)),
+    "h2_w": rng.uniform(-2, 2, (NN_PHASE_COUNT, HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
+    "h2_b": rng.uniform(-2, 2, (NN_PHASE_COUNT, HIDDEN_SIZE_2)),
+    "out_w": rng.uniform(-1, 1, (NN_PHASE_COUNT, HIDDEN_SIZE_2)),
+    "out_b": rng.uniform(-1, 1, (NN_PHASE_COUNT,)),
 }
 quantized = quantize_parameters(params)
 
@@ -87,9 +94,20 @@ while i < len(lines):
     if lines[i].startswith("POS "):
         n = int(lines[i].split()[1])
         turn = int(lines[i].split()[-1])
-        acc_w = np.array(lines[i + 1].split(), dtype=np.int32)
-        acc_b = np.array(lines[i + 2].split(), dtype=np.int32)
-        i += 3
+        # PHASE = the engine's nn_phase_index() (single hard switch),
+        # PMASKS = the 0/1 active-head masks of nn_phase_masks().
+        assert lines[i + 1].startswith("PHASE "), lines[i + 1]
+        phase = int(lines[i + 1].split()[1])
+        assert lines[i + 2].startswith("PMASKS "), lines[i + 2]
+        pmasks = [int(x) for x in lines[i + 2].split()[1:]]
+        assert all(x in (0, 1) for x in pmasks)
+        assert phase == min(j for j, x in enumerate(pmasks) if x), (
+            phase,
+            pmasks,
+        )
+        acc_w = np.array(lines[i + 3].split(), dtype=np.int32)
+        acc_b = np.array(lines[i + 4].split(), dtype=np.int32)
+        i += 5
         assert lines[i].startswith("SCORE ")
         score = int(lines[i].split()[-1])
         i += 1
@@ -121,6 +139,8 @@ while i < len(lines):
             {
                 "epd": EPS[n],
                 "turn": turn,
+                "phase": phase,
+                "pmasks": pmasks,
                 "score": score,
                 "acc_w": acc_w.tolist(),
                 "acc_b": acc_b.tolist(),

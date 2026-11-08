@@ -95,6 +95,7 @@ def model_predictions(
             mx.array(ds.afeat_w[sel]),
             mx.array(ds.afeat_b[sel]),
             mx.array(ds.turn[sel]),
+            mx.array(ds.phase[sel]),
         )
         preds.append(np.array(out))
     return np.concatenate(preds)
@@ -114,6 +115,9 @@ def _float_metrics(model: NnueNet, ds: BpdDataset, idx: np.ndarray) -> dict:
 def _quant_metrics(
     qnet: QuantizedNet, ds: BpdDataset, idx: np.ndarray, batch_size: int = 1024
 ) -> dict:
+    """Quantized-pipeline metrics, one branch per sample selected by
+    ds.phase_index (the engine's nn_phase_index(), not the blended
+    training output)."""
     preds = []
     for i in range(0, len(idx), batch_size):
         sel = idx[i : i + batch_size]
@@ -126,6 +130,7 @@ def _quant_metrics(
                 ds.afeat_w[sel],
                 ds.afeat_b[sel],
                 ds.turn[sel],
+                ds.phase_index[sel],
             )
         )
     pred_mp = np.concatenate(preds).astype(np.float64)
@@ -155,20 +160,36 @@ def weight_max_abs(model: NnueNet) -> dict:
     }
 
 
-def _loss(model, fw, fb, pfw, pfb, afw, afb, turn, target):
-    """MSE in tanh-squeezed space: targets are score/10000, but the loss
-    trains tanh(out) against tanh(target), squeezing large score swings
-    into (-1, 1).  For playing strength, capturing about-even positions
-    (eval near 0) accurately matters more than predicting large
-    positive/negative scores exactly (literature confirms), and tanh
-    biases the network toward that regime."""
-    out = mx.tanh(model(fw, fb, pfw, pfb, afw, afb, turn))
+def _loss(model, fw, fb, pfw, pfb, afw, afb, turn, target, phase):
+    """Loss in tanh-squeezed space: targets are score/10000, but the
+    loss trains tanh(out) against tanh(target), squeezing large score
+    swings into (-1, 1).  For playing strength, capturing about-even
+    positions (eval near 0) accurately matters more than predicting
+    large positive/negative scores exactly (literature confirms),
+    and tanh biases the network toward that regime.
+
+    Per-phase training with active-head masks ``phase`` (B, P) 0/1:
+      out    = each branch's output (B, P)
+      blend  = (sum a * out) / sum(a)          (the co-trained value)
+      loss   = mean |tanh(blend) - tanh(t)|^2.6          (all samples)
+             + sum(a * |tanh(out) - tanh(t)|^2.6) / sum(a)
+    The extra per-head term pins *each* active branch to the target
+    individually, so co-trained branches at a phase boundary cannot
+    drift apart (e.g. t+d / t-d would fit the blend with zero loss and
+    leave the engine's hard switch discontinuous)."""
+    out = mx.tanh(model.heads(fw, fb, pfw, pfb, afw, afb, turn))
     target = mx.tanh(target)
 
-    abs_loss = mx.abs(out - target)
-    return mx.mean(mx.power(abs_loss, 2.6))
+    a = phase.astype(out.dtype)
+    active = mx.maximum(a.sum(axis=1), 1.0)
+    blend = (out * a).sum(axis=1) / active
 
-    # return mx.mean((out - target) ** 2)
+    blend_loss = mx.mean(mx.power(mx.abs(blend - target), 2.6))
+    head_loss = mx.sum(
+        mx.power(mx.abs(out * a - target[:, None] * a), 2.6)
+    ) / mx.maximum(mx.sum(a), 1.0)
+
+    return blend_loss + head_loss
 
 
 def train(config: TrainConfig) -> Path:
@@ -200,8 +221,10 @@ def train(config: TrainConfig) -> Path:
 
     bound = config.weight_bound
 
-    def step(fw, fb, pfw, pfb, afw, afb, turn, target):
-        loss, grads = loss_and_grad_fn(model, fw, fb, pfw, pfb, afw, afb, turn, target)
+    def step(fw, fb, pfw, pfb, afw, afb, turn, target, phase):
+        loss, grads = loss_and_grad_fn(
+            model, fw, fb, pfw, pfb, afw, afb, turn, target, phase
+        )
         opt.update(model, grads)
 
         if bound is not None:
@@ -226,7 +249,8 @@ def train(config: TrainConfig) -> Path:
             afb = mx.array(ds.afeat_b[sel])
             turn = mx.array(ds.turn[sel])
             target = mx.array(ds.target[sel])
-            loss = step(fw, fb, pfw, pfb, afw, afb, turn, target)
+            phase = mx.array(ds.phase[sel])
+            loss = step(fw, fb, pfw, pfb, afw, afb, turn, target, phase)
             loss_val = float(loss.item())
             epoch_loss += loss_val
             n_batches += 1

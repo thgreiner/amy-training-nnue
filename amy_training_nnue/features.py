@@ -82,6 +82,11 @@ N_ATTACK_FEATURES = 24 * ATTACK_PLANE_SIZE  # 98304
 ACCUMULATOR_SIZE = 256
 HIDDEN_SIZE_1 = 32
 HIDDEN_SIZE_2 = 32
+# Number of game-phase branches (NN_PHASE_COUNT in amy's neural_net.h):
+# each phase has its own hidden-1, hidden-2 and output layer block in
+# the file; the input side is shared.  C's nn_export_constants() is
+# the arbiter (cross-checked in test_cfeatures.test_constants_sync).
+NN_PHASE_COUNT = 4
 # Vertical (rank) flip used for the black perspective.
 FLIP = 0x38
 # Horizontal (file) flip used to mirror the frame to the left half.

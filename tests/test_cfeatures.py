@@ -9,7 +9,7 @@ these tests pin its ABI and output:
 - test_golden_bpd_test_bin: the 5-record BPD fixture through the full
   extraction, compared against a committed golden file (generated
   from the C library; the hand-computed cases below and the C unit
-  tests in amy-eval-nnue/src/test_nn_extract.c are the independent
+  tests in amy-github/src/test_nn_extract.c are the independent
   anchors).
 - test_attack_features_hand_computed: attack plane indices from
   hand computation, including the pawn-attacks-bishop exclusion.
@@ -38,6 +38,7 @@ from amy_training_nnue.features import (
     N_ATTACK_FEATURES,
     N_FEATURES,
     N_PAWN_FEATURES,
+    NN_PHASE_COUNT,
     feature_indices,
     pawn_feature_indices,
 )
@@ -60,6 +61,7 @@ def test_constants():
     assert k.max_piece_features == 36
     assert k.max_pawn_features == 128
     assert k.max_attack_features == 32
+    assert k.phase_count == 4
 
 
 def test_constants_sync():
@@ -72,10 +74,56 @@ def test_constants_sync():
     assert k.n_pawn_features == N_PAWN_FEATURES
     assert k.n_attack_features == N_ATTACK_FEATURES
     assert k.accumulator_size == ACCUMULATOR_SIZE
+    assert k.phase_count == NN_PHASE_COUNT
     # Row-width caps: the Python ABI literals in cfeatures.py.
     assert k.max_piece_features == cfeatures.MAX_PIECE_FEATURES
     assert k.max_pawn_features == cfeatures.MAX_PAWN_FEATURES
     assert k.max_attack_features == cfeatures.MAX_ATTACK_FEATURES
+
+
+def _phase_masks(board: np.ndarray) -> list[int]:
+    """Python oracle for nn_phase_masks(): total non-pawn pieces
+    (both sides), buckets of three, plus the adjacent higher phase at
+    the top of a bucket (counts 2, 5, 8)."""
+    count = int(np.sum((np.abs(board) >= 2) & (np.abs(board) <= 5)))
+    phase = min(count // 3, NN_PHASE_COUNT - 1)
+    masks = [0] * NN_PHASE_COUNT
+    masks[phase] = 1
+    if phase < NN_PHASE_COUNT - 1 and count % 3 == 2:
+        masks[phase + 1] = 1
+    return masks
+
+
+def test_phase_masks_cross():
+    """The C library's per-record active-phase masks must match the
+    Python oracle on a battery of positions covering every phase and
+    both boundary doubles (EPDs verified against the C pipeline)."""
+    specs = [
+        # (epd, expected count, expected masks)
+        ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -", 14, [0, 0, 0, 1]),
+        ("r7/8/8/8/8/8/4K2k/8 w - -", 1, [1, 0, 0, 0]),
+        ("3r1r2/8/8/8/8/8/4K2k/8 w - -", 2, [1, 1, 0, 0]),
+        ("2R1r1r1/8/8/8/8/8/4K2k/8 w - -", 3, [0, 1, 0, 0]),
+        ("3rr3/8/8/8/8/8/2RRR3/K6k w - -", 5, [0, 1, 1, 0]),
+    ]
+    for epd, count, expected in specs:
+        board = _board_from_epd(epd)
+        assert int(np.sum((np.abs(board) >= 2) & (np.abs(board) <= 5))) == count, epd
+        rec = encode_board(board, 0, 0)
+        ex = cfeatures.extract(rec.encode(), 1)
+        assert ex.valid[0] == 1, epd
+        assert ex.phase[0].tolist() == expected, (epd, ex.phase[0].tolist())
+        assert ex.phase[0].tolist() == _phase_masks(board), epd
+
+
+def test_phase_masks_invalid_zero():
+    """Invalid records carry an all-zero phase row (like their all -1
+    feature rows)."""
+    board = _board_from_epd("4K3/8/8/8/8/8/8/8 w - -")  # no black king
+    rec = encode_board(board, 0, 0)
+    ex = cfeatures.extract(rec.encode(), 1)
+    assert ex.valid[0] == 0
+    assert (ex.phase[0] == 0).all()
 
 
 def test_golden_bpd_test_bin():

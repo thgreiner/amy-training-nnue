@@ -37,6 +37,11 @@ class BpdDataset:
             padded with -1.
         afeat_b: (N, A) int32, black attack map feature indices.
         turn:   (N,) uint8, 0 = white to move, 1 = black.
+        phase:  (N, NN_PHASE_COUNT) int8 0/1 active-phase-head masks,
+            as produced by nn_phase_masks() in the C library (always
+            at least the engine's nn_phase_index(); positions at the
+            top of a bucket, non-pawn counts 2/5/8, additionally
+            activate the adjacent higher phase for co-training).
         target: (N,) float32, stored score / target_scale.
         score:  (N,) int32, stored score in millipawns (side to move).
     """
@@ -73,6 +78,12 @@ class BpdDataset:
         self.afeat_w = gather("afeat_w")
         self.afeat_b = gather("afeat_b")
         self.turn = gather("turn")
+        # Per-sample 0/1 active-head masks (0, 0, 0, 0) from C.
+        phase = gather("phase")
+        self.phase = phase.astype(np.int8)
+        # The engine's own selector (the lower of the active phases),
+        # for QuantizedNet evaluation: nn_phase_index() = first active.
+        self.phase_index = np.argmax(phase, axis=1).astype(np.int32)
         self.score = gather("score")
         self.target = self.score.astype(np.float32) / float(target_scale)
         self.n = sum(int(mask.sum()) for _, mask in blocks)

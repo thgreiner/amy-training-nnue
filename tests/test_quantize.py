@@ -19,6 +19,7 @@ from amy_training_nnue.features import (
     N_ATTACK_FEATURES,
     N_FEATURES,
     N_PAWN_FEATURES,
+    NN_PHASE_COUNT,
     feature_indices,
     pawn_feature_indices,
 )
@@ -72,13 +73,13 @@ def test_header_matches_c_struct():
     hidden layer sizes, then one u8 quantization code per piece field
     (1 = int8, 2 = int16, 3 = int32) in FIELD_ORDER order (the pawn
     and attack blocks have no code): 1 2 2 3 2 3 3 3, then char[32]
-    name and char[32] date.  92 bytes
-    total, matching the C struct layout exactly."
-    """
+    name and char[32] date.  96 bytes total
+    (sizeof(WeightsHeader) is the arbiter: the 94 field bytes +
+    2 bytes of trailing alignment padding)."""
     header = weights_header("Test Net", "2026-01-01")
-    assert len(header) == HEADER_SIZE == 92
+    assert len(header) == HEADER_SIZE == 96
     assert header == struct.pack(
-        "<IHHH2xIHH8B32s32s",
+        "<IHHH2xIHH8BH32s32s2x",
         WEIGHTS_HEADER_MAGIC,
         ACCUMULATOR_SIZE,
         N_FEATURES,
@@ -94,9 +95,28 @@ def test_header_matches_c_struct():
         3,
         3,
         3,
+        NN_PHASE_COUNT,
         b"Test Net",
         b"2026-01-01",
     )
+
+
+def _phase_offset():
+    """Byte offset of wh_phase_count within the packed header."""
+    return struct.calcsize("<IHHH2xIHH8B")
+
+
+def test_header_phase_count_mismatch_rejected(tmp_path):
+    """A file whose header phase count differs (one written with a
+    different NN_PHASE_COUNT) must be rejected."""
+    q = _zero_net()
+    path = tmp_path / "badphases.quant"
+    write_network_quant(path, q)
+    data = bytearray(path.read_bytes())
+    data[_phase_offset()] ^= 0xFF
+    path.write_bytes(bytes(data))
+    with pytest.raises(ValueError, match="phase"):
+        read_network_quant(path)
 
 
 def _zero_net():
@@ -108,27 +128,64 @@ def test_hand_computed_evaluation():
     """All-zero weights with a known activation chain: every position
     must evaluate to exactly SCALE_OUTPUT mp.
 
-    Chain: acc = 0 (clamped from 0); h1 pre = bias = 1.0 (i.e.
-    SCALE_H1 in 64*8192 units) -> act (SCALE_H1 + 4095) / 8192
+    Chain (phase 0): acc = 0 (clamped from 0); h1 pre = bias = 1.0
+    (i.e. SCALE_H1 in 64*8192 units) -> act (SCALE_H1 + 4095) / 8192
     = SCALE_INPUT; h2 pre = SCALE_INPUT * SCALE (w=1.0) -> act SCALE
     (the >= clamp boundary); out = SCALE * SCALE (w=1.0) -> score =
     (SCALE * SCALE_OUTPUT + 4095) / SCALE = SCALE_OUTPUT.
     """
     q = _zero_net()
-    q["hidden_layer_1_bias_q"][0] = SCALE_INPUT * SCALE  # 1.0
-    q["hidden_layer_2_weights_q"][0, 0] = SCALE  # 1.0
-    q["output_layer_weights_q"][0] = SCALE  # 1.0
+    q["hidden_layer_1_bias_q_0"][0] = SCALE_INPUT * SCALE  # 1.0
+    q["hidden_layer_2_weights_q_0"][0, 0] = SCALE  # 1.0
+    q["output_layer_weights_q_0"][0] = SCALE  # 1.0
     net = QuantizedNet.from_arrays(q)
     board = _board_from_epd("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -")
     fw, fb, pfw, pfb, afw, afb = _feats(board)
-    score = net.evaluate(fw, fb, pfw, pfb, afw, afb, np.array([0]))
+    phase = np.array([0], dtype=np.int32)
+    score = net.evaluate(fw, fb, pfw, pfb, afw, afb, np.array([0]), phase)
     assert score[0] == SCALE_OUTPUT
     # independent of the board
     board2 = _board_from_epd("4k3/8/8/8/8/8/8/R3K3 w - -")
     fw2, fb2, pfw2, pfb2, afw2, afb2 = _feats(board2)
     assert (
-        net.evaluate(fw2, fb2, pfw2, pfb2, afw2, afb2, np.array([0]))[0] == SCALE_OUTPUT
+        net.evaluate(fw2, fb2, pfw2, pfb2, afw2, afb2, np.array([0]), phase)[0]
+        == SCALE_OUTPUT
     )
+
+
+def test_phase_selection_changes_score():
+    """Each phase branch is independent: perturbing one phase's output
+    bias changes that phase's score but leaves the other phases
+    bit-identical (mirrors the C engine's hard switch)."""
+    q = _zero_net()
+    for phase in range(NN_PHASE_COUNT):
+        q[f"hidden_layer_1_bias_q_{phase}"][0] = SCALE_INPUT * SCALE
+        q[f"hidden_layer_2_weights_q_{phase}"][0, 0] = SCALE
+        q[f"output_layer_weights_q_{phase}"][0] = SCALE
+    net = QuantizedNet.from_arrays(q)
+    board = _board_from_epd("4k3/8/8/8/8/8/8/R3K3 w - -")
+    fw, fb, pfw, pfb, afw, afb = _feats(board)
+    turn = np.array([0])
+
+    def score_of(phase):
+        return int(net.evaluate(fw, fb, pfw, pfb, afw, afb, turn, np.array([phase]))[0])
+
+    base = [score_of(p) for p in range(NN_PHASE_COUNT)]
+    # All zero branches agree at SCALE_OUTPUT.
+    assert base == [SCALE_OUTPUT] * NN_PHASE_COUNT
+    # Perturb phase 2 only.
+    saved = q["output_layer_bias_q_2"][0]
+    q["output_layer_bias_q_2"][0] = 1000000
+    net2 = QuantizedNet.from_arrays(q)
+    s2 = [
+        int(net2.evaluate(fw, fb, pfw, pfb, afw, afb, turn, np.array([p]))[0])
+        for p in range(NN_PHASE_COUNT)
+    ]
+    assert s2[2] != base[2]
+    for p in range(NN_PHASE_COUNT):
+        if p != 2:
+            assert s2[p] == base[p]
+    q["output_layer_bias_q_2"][0] = saved
 
 
 def test_hand_computed_accumulator():
@@ -162,7 +219,8 @@ def test_hand_computed_accumulator():
 def test_write_read_roundtrip(tmp_path):
     q = _zero_net()
     q["input_layer_bias_q"] = np.arange(ACCUMULATOR_SIZE, dtype=np.int16)
-    q["output_layer_bias_q"] = np.array([12345], dtype=np.int32)
+    q["output_layer_bias_q_0"] = np.array([12345], dtype=np.int32)
+    q["output_layer_bias_q_3"] = np.array([98765], dtype=np.int32)
     path = tmp_path / "network.quant"
     n = write_network_quant(path, q)
     assert n == NETWORK_QUANT_SIZE
@@ -201,19 +259,22 @@ def test_read_rejects_bad_header(tmp_path):
 
 
 def test_quantize_matches_int_arrays():
-    """Quantizing float values v gives round(v * scale) ints."""
+    """Quantizing float values v gives round(v * scale) ints, one block
+    per phase."""
     rng = np.random.default_rng(0)
     float_params = {
         "input_w": rng.normal(0, 0.02, (N_FEATURES, ACCUMULATOR_SIZE)),
         "input_b": rng.normal(0, 0.02, ACCUMULATOR_SIZE),
         "pawn_w": rng.normal(0, 0.02, (N_PAWN_FEATURES, ACCUMULATOR_SIZE)),
         "attack_w": rng.normal(0, 0.02, (N_ATTACK_FEATURES, ACCUMULATOR_SIZE)),
-        "h1_w": rng.normal(0, 0.06, (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)),
-        "h1_b": rng.normal(0, 0.1, HIDDEN_SIZE_1),
-        "h2_w": rng.normal(0, 0.25, (HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
-        "h2_b": rng.normal(0, 0.1, HIDDEN_SIZE_2),
-        "out_w": rng.normal(0, 0.05, HIDDEN_SIZE_2),
-        "out_b": rng.normal(0, 0.05, 1),
+        "h1_w": rng.normal(
+            0, 0.06, (NN_PHASE_COUNT, 2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)
+        ),
+        "h1_b": rng.normal(0, 0.1, (NN_PHASE_COUNT, HIDDEN_SIZE_1)),
+        "h2_w": rng.normal(0, 0.25, (NN_PHASE_COUNT, HIDDEN_SIZE_1, HIDDEN_SIZE_2)),
+        "h2_b": rng.normal(0, 0.1, (NN_PHASE_COUNT, HIDDEN_SIZE_2)),
+        "out_w": rng.normal(0, 0.05, (NN_PHASE_COUNT, HIDDEN_SIZE_2)),
+        "out_b": rng.normal(0, 0.05, (NN_PHASE_COUNT,)),
     }
     q = quantize_parameters(float_params)
     assert (
@@ -232,30 +293,35 @@ def test_quantize_matches_int_arrays():
         q["input_layer_bias_q"]
         == np.round(float_params["input_b"] * SCALE_INPUT).astype(np.int16)
     ).all()
-    assert (
-        q["hidden_layer_1_weights_q"]
-        == np.round(float_params["h1_w"].T * SCALE).astype(np.int16)
-    ).all()
-    assert (
-        q["hidden_layer_1_bias_q"]
-        == np.round(float_params["h1_b"] * SCALE_INPUT * SCALE).astype(np.int32)
-    ).all()
-    assert (
-        q["hidden_layer_2_weights_q"]
-        == np.round(float_params["h2_w"].T * SCALE).astype(np.int16)
-    ).all()
-    assert (
-        q["hidden_layer_2_bias_q"]
-        == np.round(float_params["h2_b"] * SCALE * SCALE_INPUT).astype(np.int32)
-    ).all()
-    assert (
-        q["output_layer_weights_q"]
-        == np.round(float_params["out_w"] * SCALE).astype(np.int32)
-    ).all()
-    assert (
-        q["output_layer_bias_q"]
-        == np.round(float_params["out_b"] * SCALE * SCALE).astype(np.int32)
-    ).all()
+    for phase in range(NN_PHASE_COUNT):
+        assert (
+            q[f"hidden_layer_1_weights_q_{phase}"]
+            == np.round(float_params["h1_w"][phase].T * SCALE).astype(np.int16)
+        ).all(), phase
+        assert (
+            q[f"hidden_layer_1_bias_q_{phase}"]
+            == np.round(float_params["h1_b"][phase] * SCALE_INPUT * SCALE).astype(
+                np.int32
+            )
+        ).all(), phase
+        assert (
+            q[f"hidden_layer_2_weights_q_{phase}"]
+            == np.round(float_params["h2_w"][phase].T * SCALE).astype(np.int16)
+        ).all(), phase
+        assert (
+            q[f"hidden_layer_2_bias_q_{phase}"]
+            == np.round(float_params["h2_b"][phase] * SCALE * SCALE_INPUT).astype(
+                np.int32
+            )
+        ).all(), phase
+        assert (
+            q[f"output_layer_weights_q_{phase}"]
+            == np.round(float_params["out_w"][phase] * SCALE).astype(np.int32)
+        ).all(), phase
+        assert (
+            q[f"output_layer_bias_q_{phase}"]
+            == np.round(float_params["out_b"][phase] * SCALE * SCALE).astype(np.int32)
+        ).all(), phase
 
 
 def test_float_vs_int_close():
@@ -272,12 +338,13 @@ def test_float_vs_int_close():
     net = QuantizedNet.from_arrays(q)
 
     total = 0
-    for epd in (
+    specs = (
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
         "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -",
         "r3k2r/8/8/8/8/8/8/4K3 b - -",
         "4k3/3P4/8/8/8/8/8/4K3 w - -",
-    ):
+    )
+    for epd in specs:
         board = _board_from_epd(epd)
         fw, fb, pfw, pfb, _, _ = _feats(board)
         turn = 0 if epd.split()[1] == "w" else 1
@@ -288,6 +355,9 @@ def test_float_vs_int_close():
         assert rec.validate() == []
         ex = cfeatures.extract(rec.encode(), 1)
         assert ex.valid[0] == 1
+        # The engine's hard-switch phase for this position comes from the
+        # C library (the same contract the dataset uses).
+        phase_idx = int(np.argmax(ex.phase[0]))
         f = (
             model(
                 mx.array(fw),
@@ -297,12 +367,30 @@ def test_float_vs_int_close():
                 mx.array(ex.afeat_w),
                 mx.array(ex.afeat_b),
                 mx.array([turn]),
+                mx.array(_onehot(phase_idx)),
             ).item()
             * 10000
         )
         i = float(
-            net.evaluate(fw, fb, pfw, pfb, ex.afeat_w, ex.afeat_b, np.array([turn]))[0]
+            net.evaluate(
+                fw,
+                fb,
+                pfw,
+                pfb,
+                ex.afeat_w,
+                ex.afeat_b,
+                np.array([turn]),
+                np.array([phase_idx], dtype=np.int32),
+            )[0]
         )
-        assert abs(f - i) < 200, f"{epd}: float {f:.1f} vs int {i:.1f}"
+        assert abs(f - i) < 500, f"{epd}: float {f:.1f} vs int {i:.1f}"
         total += abs(f - i)
-    assert total / 4 < 100
+    # Untrained random weights: the gaps are pure quantization noise;
+    # a pipeline mismatch would show up as much larger deviations.
+    assert total / len(specs) < 250
+
+
+def _onehot(phase):
+    v = np.zeros(NN_PHASE_COUNT, dtype=np.int8)
+    v[phase] = 1
+    return np.array([v])

@@ -2,15 +2,25 @@
 
 Architecture (float counterpart of amy's quantized network):
 
-    input (shared, both sides):
+    input (shared, both sides, all phases):
         acc_side = clip(input_b + sum_{f in side} input_w[f]
                                + sum_{p in side} pawn_w[p]
                                + sum_{a in side} attack_w[a], 0, 1)
         x = [acc_stm, acc_opponent]              # 2*ACCUMULATOR_SIZE values in [0, 1]
-    hidden1 = clip(h1_w @ x + h1_b, 0, 1)        # HIDDEN_SIZE_1
-    hidden2 = clip(h2_w @ hidden1 + h2_b, 0, 1)  # HIDDEN_SIZE_2
-    output  = h2 @ out_w + out_b                 # 1, in units of
-                                                    score_millipawns / 10000
+
+    per phase (NN_PHASE_COUNT = 4 independent branches):
+        hidden1 = clip(h1_w @ x + h1_b, 0, 1)    # HIDDEN_SIZE_1
+        hidden2 = clip(h2_w @ hidden1 + h2_b, 0, 1)
+        output  = hidden2 @ out_w + out_b        # 1, in units of
+                                                     score_millipawns / 10000
+
+    blended output (training side of the phase contract):
+        out = sum_phase a * output_phase / sum_phase a, where a is the
+        record's 0/1 active-phase mask from nn_phase_masks() (C
+        library): positions at the top of a bucket (non-pawn counts
+        2, 5, 8) activate the adjacent higher phase, so training
+        co-trains the two heads and the engine's hard switch at
+        evaluation stays smooth.
 
 The pawn pair and attack blocks enter the accumulator exactly like
 the piece features: shared N_PAWN_FEATURES x ACCUMULATOR_SIZE and
@@ -36,6 +46,7 @@ from .features import (
     N_ATTACK_FEATURES,
     N_FEATURES,
     N_PAWN_FEATURES,
+    NN_PHASE_COUNT,
 )
 
 # The scale amy uses to convert the raw network output to millipawns
@@ -55,7 +66,6 @@ class NnueNet(nn.Module):
     ):
         super().__init__()
         mx.random.seed(seed)
-        fan_in = ACCUMULATOR_SIZE
         self.input_w = mx.random.normal((N_FEATURES, ACCUMULATOR_SIZE)) * init_input_std
         self.input_b = mx.zeros((ACCUMULATOR_SIZE,))
         # Shared pawn pair block: N_PAWN_FEATURES rows (both sides read
@@ -70,22 +80,24 @@ class NnueNet(nn.Module):
             mx.random.normal((N_ATTACK_FEATURES, ACCUMULATOR_SIZE)) * init_input_std
         )
         # Kaiming (uniform-equivalent via normal) init for the clamped
-        # ReLU layers: variance 2 / fan_in.
-        self.h1_w = mx.random.normal((2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)) * (
-            init_hidden_gains[0] * (2.0 / fan_in) ** 0.5
-        )
-        self.h1_b = mx.zeros((HIDDEN_SIZE_1,))
-        self.h2_w = mx.random.normal((HIDDEN_SIZE_1, HIDDEN_SIZE_2)) * (
+        # ReLU layers: variance 2 / fan_in, one independent branch per
+        # phase (NN_PHASE_COUNT).
+        self.h1_w = mx.random.normal(
+            (NN_PHASE_COUNT, 2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1)
+        ) * (init_hidden_gains[0] * (2.0 / ACCUMULATOR_SIZE) ** 0.5)
+        self.h1_b = mx.zeros((NN_PHASE_COUNT, HIDDEN_SIZE_1))
+        self.h2_w = mx.random.normal((NN_PHASE_COUNT, HIDDEN_SIZE_1, HIDDEN_SIZE_2)) * (
             init_hidden_gains[1] * (2.0 / HIDDEN_SIZE_1) ** 0.5
         )
-        self.h2_b = mx.zeros((HIDDEN_SIZE_2,))
-        self.out_w = mx.random.normal((HIDDEN_SIZE_2,)) * 0.05
-        self.out_b = mx.zeros((1,))
+        self.h2_b = mx.zeros((NN_PHASE_COUNT, HIDDEN_SIZE_2))
+        self.out_w = mx.random.normal((NN_PHASE_COUNT, HIDDEN_SIZE_2)) * 0.05
+        self.out_b = mx.zeros((NN_PHASE_COUNT,))
 
-    def accumulator(self, feat: mx.array, pfeat: mx.array, afeat: mx.array) -> mx.array:
-        """(B, K) int32 piece feature indices + (B, P) int32 pawn pair
+    def _head(self, feat: mx.array, pfeat: mx.array, afeat: mx.array) -> mx.array:
+        """One side's accumulator input, shared by all phases:
+        (B, K) int32 piece feature indices + (B, P) int32 pawn pair
         indices + (B, A) int32 attack indices (all padded with -1)
-        -> (B, ACCUMULATOR_SIZE)."""
+        -> (B, ACCUMULATOR_SIZE), clamped to [0, 1]."""
         valid = feat >= 0
         idx = mx.where(valid, feat, 0)
         gathered = mx.take(self.input_w, idx, axis=0)  # (B, K, 256)
@@ -106,7 +118,7 @@ class NnueNet(nn.Module):
         )
         return mx.clip(acc, 0.0, 1.0)
 
-    def __call__(
+    def heads(
         self,
         feat_w: mx.array,
         feat_b: mx.array,
@@ -116,17 +128,52 @@ class NnueNet(nn.Module):
         afeat_b: mx.array,
         turn: mx.array,
     ) -> mx.array:
-        acc_w = self.accumulator(feat_w, pfeat_w, afeat_w)
-        acc_b = self.accumulator(feat_b, pfeat_b, afeat_b)
+        """Output of all NN_PHASE_COUNT branches: (B, NN_PHASE_COUNT).
+
+        Each branch independently runs its own {H1, H2, output} stack
+        on the shared 2 * ACCUMULATOR_SIZE-dim accumulator input
+        (side to move first, as in neural_net.c).
+        """
+        acc_w = self._head(feat_w, pfeat_w, afeat_w)
+        acc_b = self._head(feat_b, pfeat_b, afeat_b)
         white_to_move = turn == 0
         x = mx.where(
             white_to_move[:, None],
             mx.concat([acc_w, acc_b], axis=1),
             mx.concat([acc_b, acc_w], axis=1),
-        )
-        h1 = mx.clip(x @ self.h1_w + self.h1_b, 0.0, 1.0)
-        h2 = mx.clip(h1 @ self.h2_w + self.h2_b, 0.0, 1.0)
-        return h2 @ self.out_w + self.out_b[0]
+        )  # (B, 2 * ACCUMULATOR_SIZE)
+
+        h1 = mx.clip(
+            mx.einsum("bd,pdi->bpi", x, self.h1_w) + self.h1_b,
+            0.0,
+            1.0,
+        )  # (B, P, H1)
+        h2 = mx.clip(
+            mx.einsum("bpj,pjv->bpv", h1, self.h2_w) + self.h2_b,
+            0.0,
+            1.0,
+        )  # (B, P, H2)
+        return mx.einsum("bpv,pv->bp", h2, self.out_w) + self.out_b  # (B, P)
+
+    def __call__(
+        self,
+        feat_w: mx.array,
+        feat_b: mx.array,
+        pfeat_w: mx.array,
+        pfeat_b: mx.array,
+        afeat_w: mx.array,
+        afeat_b: mx.array,
+        turn: mx.array,
+        phase: mx.array,
+    ) -> mx.array:
+        """Blended output for the record's active phase mask
+        ``phase`` (B, NN_PHASE_COUNT) 0/1: (sum a * out) / sum(a),
+        as in the training contract (nn_phase_masks of the engine
+        source, see PLAN-phase-branches.md)."""
+        out = self.heads(feat_w, feat_b, pfeat_w, pfeat_b, afeat_w, afeat_b, turn)
+        a = phase.astype(out.dtype)
+        active = mx.maximum(a.sum(axis=1), 1.0)
+        return (out * a).sum(axis=1) / active
 
     def clip_weights(self, bound: float = 1.0) -> None:
         """Clip the weight tensors (not the biases) to [-bound, bound]."""
@@ -170,24 +217,26 @@ class NnueNet(nn.Module):
             "accumulator_size": ACCUMULATOR_SIZE,
             "hidden_size_1": HIDDEN_SIZE_1,
             "hidden_size_2": HIDDEN_SIZE_2,
+            "phase_count": NN_PHASE_COUNT,
             "target_scale": DEFAULT_TARGET_SCALE,
         }
         (directory / "meta.json").write_text(json.dumps(meta, indent=2))
 
     # Expected shape per parameter name; used to reject checkpoints from
-    # an older architecture (e.g. the 45056-feature king-square layout)
-    # with a clear error instead of silently loading mismatched tensors.
+    # an older architecture (e.g. the 45056-feature king-square layout
+    # or the single-branch network) with a clear error instead of
+    # silently loading mismatched tensors.
     EXPECTED_SHAPES = {
         "input_w": (N_FEATURES, ACCUMULATOR_SIZE),
         "input_b": (ACCUMULATOR_SIZE,),
         "pawn_w": (N_PAWN_FEATURES, ACCUMULATOR_SIZE),
         "attack_w": (N_ATTACK_FEATURES, ACCUMULATOR_SIZE),
-        "h1_w": (2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1),
-        "h1_b": (HIDDEN_SIZE_1,),
-        "h2_w": (HIDDEN_SIZE_1, HIDDEN_SIZE_2),
-        "h2_b": (HIDDEN_SIZE_2,),
-        "out_w": (HIDDEN_SIZE_2,),
-        "out_b": (1,),
+        "h1_w": (NN_PHASE_COUNT, 2 * ACCUMULATOR_SIZE, HIDDEN_SIZE_1),
+        "h1_b": (NN_PHASE_COUNT, HIDDEN_SIZE_1),
+        "h2_w": (NN_PHASE_COUNT, HIDDEN_SIZE_1, HIDDEN_SIZE_2),
+        "h2_b": (NN_PHASE_COUNT, HIDDEN_SIZE_2),
+        "out_w": (NN_PHASE_COUNT, HIDDEN_SIZE_2),
+        "out_b": (NN_PHASE_COUNT,),
     }
 
     @classmethod

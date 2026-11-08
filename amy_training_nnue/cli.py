@@ -138,7 +138,14 @@ def cmd_evaluate(args) -> int:
     for path in args.files:
         records.extend(list(read_records(path)))
     preds = qnet.evaluate(
-        ds.feat_w, ds.feat_b, ds.pfeat_w, ds.pfeat_b, ds.afeat_w, ds.afeat_b, ds.turn
+        ds.feat_w,
+        ds.feat_b,
+        ds.pfeat_w,
+        ds.pfeat_b,
+        ds.afeat_w,
+        ds.afeat_b,
+        ds.turn,
+        ds.phase_index,
     )
     shown = 0
     for i in range(ds.n):
